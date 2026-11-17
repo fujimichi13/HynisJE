@@ -41,21 +41,9 @@ jobs:
       - name: Apply our 3D image, SSBO and compute changes
         run: python3 scripts/apply_gl4metal_patch.py Natives/external/gl4metal
 
-      - name: Diagnose and work around missing clear-value function
+      - name: Add weak fallback for clear-value function
         run: |
           cd Natives/external/gl4metal/gl4metal
-          echo "--- uses of gl4metalEncodeClearValue ---"
-          grep -n 'gl4metalEncodeClearValue' texture.h texture.mm || true
-          line=$(grep -n '^bool gl4metalEncodeClearValue' texture.mm | head -n 1 | cut -d: -f1 || true)
-          if [ -n "$line" ]; then
-            echo "--- definition found at line $line; enclosing structure above it ---"
-            awk -v L="$line" 'NR<L && /^(namespace|extern "C|#if|#else|#endif|#ifdef|#ifndef|static bool encodeClearTexel)/ {print NR": "$0}' texture.mm | tail -n 15
-            echo "--- context ---"
-            sed -n "$((line-8)),$((line+8))p" texture.mm
-          else
-            echo "definition NOT found in texture.mm"
-          fi
-          echo "--- adding weak fallback definition ---"
           cat >> texture.mm <<'EOF'
 
           __attribute__((weak)) bool gl4metalEncodeClearValue(GLenum internalformat, GLenum format, GLenum type, const void *data,
@@ -79,6 +67,18 @@ jobs:
           ref: main
           path: Natives/external/MobileGlues
           submodules: recursive
+          fetch-depth: 0
+
+      - name: Select MobileGlues revision
+        run: |
+          cd Natives/external/MobileGlues
+          if git checkout --detach 0502bdf; then
+            echo "Pinned MobileGlues to iOS-era commit 0502bdf"
+            git submodule update --init --recursive
+          else
+            echo "Could not find 0502bdf, staying on main"
+          fi
+          git log -1 --oneline
 
       - name: Locate MobileGlues sources
         run: |
@@ -108,6 +108,8 @@ jobs:
           from pathlib import Path
 
           root = Path('Natives/external/MobileGlues/src/main/cpp').resolve()
+
+          # 1. Replace unsupported alias attributes with forwarding functions.
           pattern = re.compile(
               r'(?P<head>GLAPI[^;{}]*?\b(?P<name>\w+)\s*\((?P<params>[^;{}]*?)\))'
               r'\s*__attribute__\(\(alias\("(?P<target>\w+)"\)\)\)\s*;', re.S)
@@ -133,10 +135,24 @@ jobs:
                   path.write_text(new)
                   total += count
                   print(f'{path}: rewrote {count} alias declaration(s)')
-          print('total rewritten:', total)
+          print('alias declarations rewritten:', total)
+
+          # 2. Replace the Linux-only gettid syscall.
+          for path in root.rglob('*'):
+              if path.suffix not in ('.h', '.hpp', '.cpp', '.c'):
+                  continue
+              text = path.read_text(errors='ignore')
+              if '__NR_gettid' not in text:
+                  continue
+              text = re.sub(r'\(int\)\s*syscall\(\s*__NR_gettid\s*\)',
+                            '(int)pthread_mach_thread_np(pthread_self())', text)
+              if '#include <pthread.h>' not in text:
+                  text = '#include <pthread.h>\n' + text
+              path.write_text(text)
+              print('patched gettid in', path)
           PY
-          echo "--- remaining alias attributes ---"
-          grep -rn 'alias(' Natives/external/MobileGlues/src/main/cpp --include=*.cpp --include=*.c --include=*.h | head -n 20 || true
+          echo "--- remaining Linux-only spots ---"
+          grep -rn '__NR_gettid\|alias(' Natives/external/MobileGlues/src/main/cpp --include=*.cpp --include=*.c --include=*.h | head -n 20 || true
 
       - name: Install build tools
         run: brew install make ldid wget cmake
