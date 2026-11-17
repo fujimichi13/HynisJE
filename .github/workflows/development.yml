@@ -52,7 +52,6 @@ jobs:
           	return encodeClearTexel(metalPixelFormat(internalformat), internalformat, format, type, data, output, bytes, sourceBytes);
           }
           EOF
-          tail -n 8 texture.mm
 
       - name: Checkout launcher dependencies
         run: |
@@ -109,7 +108,6 @@ jobs:
 
           root = Path('Natives/external/MobileGlues/src/main/cpp').resolve()
 
-          # 1. Replace unsupported alias attributes with forwarding functions.
           pattern = re.compile(
               r'(?P<head>GLAPI[^;{}]*?\b(?P<name>\w+)\s*\((?P<params>[^;{}]*?)\))'
               r'\s*__attribute__\(\(alias\("(?P<target>\w+)"\)\)\)\s*;', re.S)
@@ -134,10 +132,8 @@ jobs:
               if count:
                   path.write_text(new)
                   total += count
-                  print(f'{path}: rewrote {count} alias declaration(s)')
           print('alias declarations rewritten:', total)
 
-          # 2. Replace the Linux-only gettid syscall.
           for path in root.rglob('*'):
               if path.suffix not in ('.h', '.hpp', '.cpp', '.c'):
                   continue
@@ -151,8 +147,6 @@ jobs:
               path.write_text(text)
               print('patched gettid in', path)
           PY
-          echo "--- remaining Linux-only spots ---"
-          grep -rn '__NR_gettid\|alias(' Natives/external/MobileGlues/src/main/cpp --include=*.cpp --include=*.c --include=*.h | head -n 20 || true
 
       - name: Install build tools
         run: brew install make ldid wget cmake
@@ -185,10 +179,28 @@ jobs:
             xcrun --sdk iphoneos metal -std="$standard" -c "$source" -o "$source.air"
           done
 
+      - name: Build MobileGlues (lists every error at the end)
+        run: |
+          set -o pipefail
+          status=0
+          MAKEFLAGS=k gmake dep_mg PLATFORM=2 JOBS=3 BOOTJDK="$JAVA_HOME/bin" 2>&1 | tee mg.log || status=$?
+          echo
+          echo "=============== ERRORS ==============="
+          grep -E 'error:|fatal error:|undefined symbol|Undefined symbols' mg.log | sed 's|/Users/runner/work/HynisJE/HynisJE/||' | sort -u | head -n 60 || true
+          echo "======================================="
+          exit $status
+
       - name: Build iOS IPA and TrollStore TIPA
         run: |
-          gmake -j2 dsym package PLATFORM=2 JOBS=3 SLIMMED=1 BOOTJDK="$JAVA_HOME/bin"
-          gmake -j2 dsym package PLATFORM=2 JOBS=3 SLIMMED=1 BOOTJDK="$JAVA_HOME/bin" TROLLSTORE_JIT_ENT=1
+          set -o pipefail
+          status=0
+          { gmake -j2 dsym package PLATFORM=2 JOBS=3 SLIMMED=1 BOOTJDK="$JAVA_HOME/bin" && \
+            gmake -j2 dsym package PLATFORM=2 JOBS=3 SLIMMED=1 BOOTJDK="$JAVA_HOME/bin" TROLLSTORE_JIT_ENT=1; } 2>&1 | tee build.log || status=$?
+          echo
+          echo "=============== ERRORS ==============="
+          grep -E 'error:|fatal error:|Undefined symbols|No such file|\*\*\* \[' build.log | sed 's|/Users/runner/work/HynisJE/HynisJE/||' | sort -u | head -n 60 || true
+          echo "======================================="
+          exit $status
 
       - name: Record the exact renderer build
         run: |
