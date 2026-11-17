@@ -17,6 +17,7 @@ include_directories(
   "external/AFNetworking/AFNetworking"
   "external/AFNetworking/UIKit+AFNetworking"
   "external/DBNumberedSlider/Classes"
+  "external/DayNightSwitch"
   "external/NRFileManager"
   "external/UnzipKit"
   "external/fishhook"
@@ -119,6 +120,7 @@ add_executable(Hynis
   customcontrols/NSPredicateUtilitiesExternal.m
 
   external/DBNumberedSlider/Classes/DBNumberedSlider.m
+  external/DayNightSwitch/DayNightSwitch.m
   external/NRFileManager/NSFileManager+NRFileManager.m
   external/ballpa1n/HostManager.c
   external/ballpa1n/wrapped/HostManagerBridge.m
