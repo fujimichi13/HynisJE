@@ -41,6 +41,15 @@ jobs:
       - name: Apply our 3D image, SSBO and compute changes
         run: python3 scripts/apply_gl4metal_patch.py Natives/external/gl4metal
 
+      - name: Fix gl4metal clear-value linkage
+        run: |
+          cd Natives/external/gl4metal/gl4metal
+          sed -i '' 's/^bool gl4metalEncodeClearValue(/extern "C" bool gl4metalEncodeClearValue(/' texture.h
+          echo "--- uses of gl4metalEncodeClearValue ---"
+          grep -n 'gl4metalEncodeClearValue' texture.h texture.mm || true
+          echo "--- structure lines in texture.mm ---"
+          grep -n 'extern "C"\|^namespace\|^#if\|^#endif' texture.mm | head -n 80 || true
+
       - name: Checkout launcher dependencies
         run: |
           git submodule update --init --recursive -- \
@@ -54,6 +63,27 @@ jobs:
           ref: main
           path: Natives/external/MobileGlues
           submodules: recursive
+
+      - name: Locate MobileGlues sources
+        run: |
+          cd Natives/external/MobileGlues
+          if [ ! -d src/main/cpp ]; then
+            found=$(find . -type d -path '*/src/main/cpp' -not -path './.git/*' | head -n 1)
+            mkdir -p src/main
+            if [ -n "$found" ]; then
+              echo "Found sources at $found"
+              ln -s "$PWD/$found" src/main/cpp
+            elif [ -f MobileGlues-cpp/CMakeLists.txt ]; then
+              echo "Using MobileGlues-cpp directly"
+              ln -s "$PWD/MobileGlues-cpp" src/main/cpp
+            else
+              echo "Could not find MobileGlues sources. Repository layout:"
+              find . -maxdepth 3 -not -path './.git/*' | head -n 80
+              exit 1
+            fi
+          fi
+          ls src/main/cpp | head -n 30
+          ls src/main/cpp/libraries/ios || true
 
       - name: Install build tools
         run: brew install make ldid wget cmake
