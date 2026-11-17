@@ -41,14 +41,30 @@ jobs:
       - name: Apply our 3D image, SSBO and compute changes
         run: python3 scripts/apply_gl4metal_patch.py Natives/external/gl4metal
 
-      - name: Fix gl4metal clear-value linkage
+      - name: Diagnose and work around missing clear-value function
         run: |
           cd Natives/external/gl4metal/gl4metal
-          sed -i '' 's/^bool gl4metalEncodeClearValue(/extern "C" bool gl4metalEncodeClearValue(/' texture.h
           echo "--- uses of gl4metalEncodeClearValue ---"
           grep -n 'gl4metalEncodeClearValue' texture.h texture.mm || true
-          echo "--- structure lines in texture.mm ---"
-          grep -n 'extern "C"\|^namespace\|^#if\|^#endif' texture.mm | head -n 80 || true
+          line=$(grep -n '^bool gl4metalEncodeClearValue' texture.mm | head -n 1 | cut -d: -f1 || true)
+          if [ -n "$line" ]; then
+            echo "--- definition found at line $line; enclosing structure above it ---"
+            awk -v L="$line" 'NR<L && /^(namespace|extern "C|#if|#else|#endif|#ifdef|#ifndef|static bool encodeClearTexel)/ {print NR": "$0}' texture.mm | tail -n 15
+            echo "--- context ---"
+            sed -n "$((line-8)),$((line+8))p" texture.mm
+          else
+            echo "definition NOT found in texture.mm"
+          fi
+          echo "--- adding weak fallback definition ---"
+          cat >> texture.mm <<'EOF'
+
+          __attribute__((weak)) bool gl4metalEncodeClearValue(GLenum internalformat, GLenum format, GLenum type, const void *data,
+          		uint8_t output[16], size_t &bytes) {
+          	size_t sourceBytes = 0;
+          	return encodeClearTexel(metalPixelFormat(internalformat), internalformat, format, type, data, output, bytes, sourceBytes);
+          }
+          EOF
+          tail -n 8 texture.mm
 
       - name: Checkout launcher dependencies
         run: |
@@ -84,6 +100,43 @@ jobs:
           fi
           ls src/main/cpp | head -n 30
           ls src/main/cpp/libraries/ios || true
+
+      - name: Make MobileGlues compile on Apple platforms
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          root = Path('Natives/external/MobileGlues/src/main/cpp').resolve()
+          pattern = re.compile(
+              r'(?P<head>GLAPI[^;{}]*?\b(?P<name>\w+)\s*\((?P<params>[^;{}]*?)\))'
+              r'\s*__attribute__\(\(alias\("(?P<target>\w+)"\)\)\)\s*;', re.S)
+
+          def rewrite(m):
+              head, name = m.group('head'), m.group('name')
+              params, target = m.group('params').strip(), m.group('target')
+              ret = head[:head.rindex(name)]
+              args = []
+              if params and params != 'void':
+                  for p in params.split(','):
+                      found = re.search(r'(\w+)\s*(\[[^\]]*\])?\s*$', p.strip())
+                      args.append(found.group(1))
+              is_void = re.search(r'\bvoid\b', ret) and '*' not in ret
+              body = ('' if is_void else 'return ') + target + '(' + ', '.join(args) + ');'
+              return head + ' { ' + body + ' }'
+
+          total = 0
+          for path in list(root.rglob('*.cpp')) + list(root.rglob('*.c')) + list(root.rglob('*.h')):
+              text = path.read_text(errors='ignore')
+              new, count = pattern.subn(rewrite, text)
+              if count:
+                  path.write_text(new)
+                  total += count
+                  print(f'{path}: rewrote {count} alias declaration(s)')
+          print('total rewritten:', total)
+          PY
+          echo "--- remaining alias attributes ---"
+          grep -rn 'alias(' Natives/external/MobileGlues/src/main/cpp --include=*.cpp --include=*.c --include=*.h | head -n 20 || true
 
       - name: Install build tools
         run: brew install make ldid wget cmake
