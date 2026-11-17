@@ -2,19 +2,23 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <libgen.h>
+#include <mach/mach.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "utils.h"
+#include "ctxbridges/gl4metal_bridge.h"
 
 #import "ios_uikit_bridge.h"
 #import "JavaLauncher.h"
 #import "LauncherPreferences.h"
+#import "MinecraftOptionUtils.h"
+#import "PLLogOutputView.h"
 #import "PLProfiles.h"
 
 #define fm NSFileManager.defaultManager
@@ -22,9 +26,10 @@
 extern char **environ;
 
 BOOL validateVirtualMemorySpace(size_t size) {
+    size <<= 20; // convert to MB
     void *map = mmap(0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    // Check if process successfully maps and unmaps a contiguous range
-    if (map == MAP_FAILED || munmap(map, size) != 0)
+    // check if process successfully maps and unmaps a contiguous range
+    if(map == MAP_FAILED || munmap(map, size) != 0)
         return NO;
     return YES;
 }
@@ -36,7 +41,7 @@ void init_loadDefaultEnv() {
     setenv("LD_LIBRARY_PATH", "", 1);
 
     // Ignore mipmap for performance(?) seems does not affect iOS
-    setenv("LIBGL_MIPMAP", "3", 1);
+    //setenv("LIBGL_MIPMAP", "3", 1);
 
     // Disable overloaded functions hack for Minecraft 1.17+
     setenv("LIBGL_NOINTOVLHACK", "1", 1);
@@ -100,24 +105,56 @@ void init_loadCustomJvmFlags(int* argc, const char** argv) {
 int launchJVM(NSString *username, id launchTarget, int width, int height, int minVersion) {
     NSLog(@"[JavaLauncher] Beginning JVM launch");
 
-    if ([NSFileManager.defaultManager fileExistsAtPath:[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"LSAppInfo.plist"]]) {
-        NSDebugLog(@"[JavaLauncher] Running in LiveContainer, skipping dyld patch");
-    } else {
-        if (@available(iOS 26.0, *)) {
-            // Disable Library Validtion bypass for iOS 26 because of stricter JIT
-        } else {
-            // Activate Library Validation bypass for external runtime and dylibs (JNA, etc)
-            init_bypassDyldLibValidation();
-        }
-    }
-
-
     init_loadDefaultEnv();
     init_loadCustomEnv();
+
+    DeviceGetJITFlags(YES); // refresh JIT flags right after loading env
+    BOOL requiresTXMWorkaround = DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM);
+    BOOL jit26AlwaysAttached = getPrefBool(@"debug.debug_always_attached_jit");
+    if (requiresTXMWorkaround) {
+        static void *result;
+        if(!result) result = JIT26CreateRegionLegacy(getpagesize());
+        if ((uint32_t)result != 0x690000E0) {
+            munmap(result, getpagesize());
+            // we can't continue since legacy script only allows calling breakpoint once
+            NSString *inBundleScriptPath = [NSBundle.mainBundle pathForResource:@"UniversalJIT26" ofType:@"js"];
+            NSString *lcAppInfoPath = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"LCAppInfo.plist"];
+            NSMutableDictionary *lcAppInfo = [NSMutableDictionary dictionaryWithContentsOfFile:lcAppInfoPath];
+            if(lcAppInfo) {
+                // if this is inside LiveContainer, we assign script ourselves and prompt user to restart Hynis
+                lcAppInfo[@"jitLaunchScriptJs"] = [[NSData dataWithContentsOfFile:inBundleScriptPath] base64EncodedStringWithOptions:0];
+                if([lcAppInfo writeToFile:lcAppInfoPath atomically:YES]) {
+                    showDialog(localize(@"Error", nil), @"Hynis was launched with a legacy script. We have updated the script to Universal, please restart LiveContainer to continue.");
+                    [PLLogOutputView handleExitCode:1];
+                    return 1;
+                }
+            }
+            [NSFileManager.defaultManager copyItemAtPath:inBundleScriptPath toPath:[NSString stringWithFormat:@"%s/UniversalJIT26.js", getenv("POJAV_HOME")] error:nil];
+            showDialog(localize(@"Error", nil), @"Support for legacy script has been removed. Please switch to Universal JIT script. To import it, long-press on Hynis when enabling JIT in StikDebug and tap \"Assign Script\", then go to Hynis's Documents directory and pick it. (on sideloaded StikDebug, the builtin script is named Hynis-MeloNX.js)");
+            [PLLogOutputView handleExitCode:1];
+            return 1;
+        }
+        JIT26SendJITScript([NSString stringWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"UniversalJIT26Extension" ofType:@"js"]]);
+        JIT26SetDetachAfterFirstBr(!jit26AlwaysAttached);
+        // make sure we don't get stuck in EXC_BAD_ACCESS
+        task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, 0, EXCEPTION_DEFAULT, MACHINE_THREAD_STATE);
+    }
+    if (!requiresTXMWorkaround || jit26AlwaysAttached) {
+        if (jit26AlwaysAttached) {
+            // Only allow StikDebug to catch our breakpoints to prevent any stutters
+            task_set_exception_ports(mach_task_self(), EXC_MASK_ALL & ~EXC_MASK_BREAKPOINT, 0,
+                EXCEPTION_DEFAULT, THREAD_STATE_NONE);
+        }
+        // Activate Library Validation bypass for external runtime and dylibs (JNA, etc)
+        init_bypassDyldLibValidation();
+    } else {
+        NSLog(@"[DyldLVBypass] Hook disabled! Loading unsigned dylib will cause code signature error.");
+    }
 
     BOOL launchJar = NO;
     NSString *gameDir;
     NSString *defaultJRETag;
+    NSCAssert(launchTarget, @"Unexpected nil launchTarget");
     if ([launchTarget isKindOfClass:NSDictionary.class]) {
         // Get preferred Java version from current profile
         int preferredJavaVersion = [PLProfiles resolveKeyForCurrentProfile:@"javaVersion"].intValue;
@@ -135,10 +172,10 @@ int launchJVM(NSString *username, id launchTarget, int width, int height, int mi
             defaultJRETag = @"1_17_newer";
         }
 
-        // Setup POJAV_RENDERER
+        // Setup HYNIS_RENDERER
         NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
         NSLog(@"[JavaLauncher] RENDERER is set to %@\n", renderer);
-        setenv("POJAV_RENDERER", renderer.UTF8String, 1);
+        setenv("HYNIS_RENDERER", renderer.UTF8String, 1);
         // Setup gameDir
         gameDir = [NSString stringWithFormat:@"%s/instances/%@/%@",
             getenv("POJAV_HOME"), getPrefObject(@"general.game_directory"),
@@ -163,13 +200,10 @@ int launchJVM(NSString *username, id launchTarget, int width, int height, int mi
         NSString *dest = [NSString stringWithFormat:@"%@/lib/libawt_xawt.dylib", javaHome];
         NSString *source = [NSString stringWithFormat:@"%@/Frameworks/libawt_xawt.dylib", NSBundle.mainBundle.bundlePath];
         NSError *error;
-        if (![fm fileExistsAtPath:dest]) {
-            [fm copyItemAtPath:source toPath:dest error:&error];
-            if (error) {
-                NSLog(@"[JavaLauncher] Failed to copy libawt_xawt.dylib: %@", error.localizedDescription);
-            } else {
-                NSLog(@"[JavaLauncher] Copied libawt_xawt.dylib to %@", dest);
-            }
+        [fm removeItemAtPath:dest error:nil];
+        [fm copyItemAtPath:source toPath:dest error:&error];
+        if (error) {
+            NSLog(@"[JavaLauncher] Copy libawt_xawt.dylib failed: %@", error.localizedDescription);
         }
     }
 
@@ -179,17 +213,24 @@ int launchJVM(NSString *username, id launchTarget, int width, int height, int mi
     int allocmem;
     if (getPrefBool(@"java.auto_ram")) {
         CGFloat autoRatio = getEntitlementValue(@"com.apple.private.memorystatus") ? 0.4 : 0.25;
-        allocmem = roundf((NSProcessInfo.processInfo.physicalMemory / 1048576) * autoRatio);
+        allocmem = roundf((NSProcessInfo.processInfo.physicalMemory >> 20) * autoRatio);
     } else {
         allocmem = getPrefInt(@"java.allocated_memory");
     }
     NSLog(@"[JavaLauncher] Max RAM allocation is set to %d MB", allocmem);
     if (!validateVirtualMemorySpace(allocmem)) {
         UIKit_returnToSplitView();
-        showDialog(localize(@"Error", nil), @"Insufficient contiguous virtual memory space. Lower memory allocation and try again.");
+        if (getEntitlementValue(@"com.apple.developer.kernel.increased-memory-limit")) {
+            showDialog(localize(@"Error", nil), @"Insufficient contiguous virtual memory space. Lower memory allocation and try again.");
+        } else {
+            showDialog(localize(@"Error", nil), @"Insufficient contiguous virtual memory space. Increased Memory Limit entitlement is missing, please add it via GetMoreRam app.");
+        }
         return 1;
     }
 
+    // Setup options.txt
+    [MinecraftOptionUtils setupOptionsAtGameDir:gameDir];
+    
     int margc = -1;
     const char *margv[1000];
 
@@ -200,14 +241,7 @@ int launchJVM(NSString *username, id launchTarget, int width, int height, int mi
     }
     margv[++margc] = "-Xms128M";
     margv[++margc] = [NSString stringWithFormat:@"-Xmx%dM", allocmem].UTF8String;
-
-    NSString *bundlePath = NSBundle.mainBundle.bundlePath;
-    NSString *nativeLibrariesPath = [NSString stringWithFormat:@"%@/Frameworks", bundlePath];
-    // setup lwjgl
-    NSString *lwjglVersion = [PLProfiles resolveKeyForCurrentProfile:@"lwjglVersion"];
-    NSLog(@"[JavaLauncher] lwjgl version is set to %@", lwjglVersion);
-    nativeLibrariesPath = [nativeLibrariesPath stringByAppendingFormat:@":%@/Frameworks/lwjgl/%@", bundlePath, lwjglVersion];
-    margv[++margc] = [NSString stringWithFormat:@"-Djava.library.path=%@", nativeLibrariesPath].UTF8String;
+    margv[++margc] = [NSString stringWithFormat:@"-Djava.library.path=%@/Frameworks", NSBundle.mainBundle.bundlePath].UTF8String;
     margv[++margc] = [NSString stringWithFormat:@"-Duser.dir=%@", gameDir].UTF8String;
     margv[++margc] = [NSString stringWithFormat:@"-Duser.home=%s", getenv("POJAV_HOME")].UTF8String;
     margv[++margc] = [NSString stringWithFormat:@"-Duser.timezone=%@", NSTimeZone.localTimeZone.name].UTF8String;
@@ -217,12 +251,15 @@ int launchJVM(NSString *username, id launchTarget, int width, int height, int mi
     //margv[++margc] = "-Dorg.lwjgl.util.NoChecks=true";
     margv[++margc] = "-Dlog4j2.formatMsgNoLookups=true";
 
-    // Preset OpenGL libname
-    const char *glLibName = getenv("POJAV_RENDERER");
+    // Preset OpenGL libname before LWJGL can initialize its cached provider.
+    const char *glLibName = getenv("HYNIS_RENDERER");
     if (glLibName) {
         if (!strcmp(glLibName, "auto")) {
             // workaround only applies to 1.20.2+
-            glLibName = RENDERER_NAME_MOBILEGLUES;
+            glLibName = RENDERER_NAME_MTL_ANGLE;
+        }
+        if (!strcmp(glLibName, RENDERER_NAME_GL4METAL)) {
+            glLibName = gl4metalLibraryPath().UTF8String;
         }
         margv[++margc] = [NSString stringWithFormat:@"-Dorg.lwjgl.opengl.libname=%s", glLibName].UTF8String;
     }
@@ -232,7 +269,7 @@ int launchJVM(NSString *username, id launchTarget, int width, int height, int mi
     if(getPrefBool(@"general.cosmetica")) {
         margv[++margc] = [NSString stringWithFormat:@"-javaagent:%@/arc_dns_injector.jar=23.95.137.176", librariesPath].UTF8String;
     }
-    if(getPrefBool(@"video.fix_simple_voice_chat_mod")) {
+    if (getPrefBool(@"video.fix_simple_voice_chat_mod")) {
         margv[++margc] = [NSString stringWithFormat:@"-javaagent:%@/patchsvc.jar=", librariesPath].UTF8String;
     }
 
@@ -330,8 +367,6 @@ int launchJVM(NSString *username, id launchTarget, int width, int height, int mi
     NSLog(@"[Init] Found JLI lib");
 
     NSString *classpath = [NSString stringWithFormat:@"%@/*", librariesPath];
-    classpath = [classpath stringByAppendingFormat:@":%@/lwjgl/lwjgl-%@.jar", librariesPath, lwjglVersion];
-
     if (launchJar) {
         classpath = [classpath stringByAppendingFormat:@":%@", launchTarget];
     }

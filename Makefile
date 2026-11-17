@@ -12,6 +12,7 @@ DETECTARCH  := $(shell uname -m)
 VERSION     := 1.0
 BRANCH      := $(shell git branch --show-current)
 COMMIT      := $(shell git log --oneline | sed '2,10000000d' | cut -b 1-7)
+PLATFORM    ?= 2
 
 # Release vs Debug
 RELEASE ?= 0
@@ -27,8 +28,13 @@ SLIMMED_ONLY ?= 0
 
 # If not in a GitHub repository, default to these
 # so that compiling doesn't fail
-BRANCH ?= "unknown"
-COMMIT ?= "unknown"
+ifeq (,$(BRANCH))
+BRANCH := unknown
+endif
+ifeq (,$(COMMIT))
+BRANCH := unknown
+endif
+
 
 # Team IDs and provisioning profile for the codesign function
 # Default to -1 for check
@@ -43,6 +49,11 @@ else
 CMAKE_BUILD_TYPE := Debug
 endif
 
+# Override the source directory to use a locally modified gl4metal checkout.
+GL4METAL_SOURCE_DIR ?= $(CURDIR)/Natives/external/gl4metal
+# Alternatively supply a prebuilt arm64 iOS dylib with the bridge C exports.
+GL4METAL_LIBRARY ?=
+
 
 # Distinguish iOS from macOS, and *OS from others
 ifeq ($(DETECTPLAT),Darwin)
@@ -54,8 +65,8 @@ BOOTJDK     ?= $(shell /usr/libexec/java_home -v 1.8)/bin
 $(warning Building on macOS.)
 else
 IOS         := 1
-SDKPATH     ?= /var/jb/usr/share/SDKs/iPhoneOS.sdk
-BOOTJDK     ?= /var/jb/usr/lib/jvm/java-8-openjdk/bin
+SDKPATH     ?= /usr/share/SDKs/iPhoneOS.sdk
+BOOTJDK     ?= /usr/lib/jvm/java-8-openjdk/bin
 ifeq ($(shell test "$(OSVER)" -gt 14; echo $$?),0)
 PREFIX      ?= /var/jb/
 else
@@ -69,14 +80,40 @@ IOS         := 0
 BOOTJDK     ?= /usr/bin
 $(warning Building on Linux. Note that all targets may not compile or require external components.)
 else
-$(error This platform is not currently supported for building Hynis)
+$(error This platform is not currently supported for building Hynis.)
 endif
 
-HYNIS_BUNDLE_DIR      ?= $(OUTPUTDIR)/Hynis.app
-HYNIS_JRE8_DIR        ?= $(SOURCEDIR)/depends/java-8-openjdk
-HYNIS_JRE17_DIR       ?= $(SOURCEDIR)/depends/java-17-openjdk
-HYNIS_JRE21_DIR       ?= $(SOURCEDIR)/depends/java-21-openjdk
-HYNIS_JRE25_DIR       ?= $(SOURCEDIR)/depends/java-25-openjdk
+# Define PLATFORM_NAME from PLATFORM
+ifeq ($(PLATFORM),2)
+PLATFORM_NAME := ios
+$(warning Set PLATFORM to 2, which is equal to iOS.)
+else ifeq ($(PLATFORM),3)
+PLATFORM_NAME := tvos
+$(warning Set PLATFORM to 3, which is equal to tvOS.)
+else ifeq ($(PLATFORM),6)
+PLATFORM_NAME := maccatalyst
+$(warning Set PLATFORM to 6, which is equal to Mac Catalyst.)
+else ifeq ($(PLATFORM),7)
+PLATFORM_NAME := iossimulator
+$(warning Set PLATFORM to 7, which is equal to iOS Simulator.)
+else ifeq ($(PLATFORM),8)
+PLATFORM_NAME := tvossimulator
+$(warning Set PLATFORM to 8, which is equal to tvOS Simulator.)
+else ifeq ($(PLATFORM),11)
+PLATFORM_NAME := xros
+$(warning Set PLATFORM to 11, which is equal to visionOS.)
+else ifeq ($(PLATFORM),12)
+PLATFORM_NAME := xrsimulator
+$(warning Set PLATFORM to 12, which is equal to visionOS Simulator.)
+else
+$(error PLATFORM is not valid.)
+endif
+
+POJAV_BUNDLE_DIR      ?= $(OUTPUTDIR)/Hynis.app
+POJAV_JRE8_DIR        ?= $(SOURCEDIR)/depends/java-8-openjdk
+POJAV_JRE17_DIR       ?= $(SOURCEDIR)/depends/java-17-openjdk
+POJAV_JRE21_DIR       ?= $(SOURCEDIR)/depends/java-21-openjdk
+POJAV_JRE25_DIR       ?= $(SOURCEDIR)/depends/java-25-openjdk
 
 # Function to use later for checking dependencies
 METHOD_DEPCHECK   = $(shell $(1) >/dev/null 2>&1 && echo 1)
@@ -97,6 +134,18 @@ METHOD_DIRCHECK   = \
 		rm -rf $(1)/*; \
 	fi
 	
+# Function to change the platform on Mach-O files.
+# iOS = 2, tvOS = 3, iOS Simulator = 7, tvOS Simulator = 8, visionOS = 11, visionOS Simulator = 12
+# https://github.com/apple-oss-distributions/xnu/blob/main/EXTERNAL_HEADERS/mach-o/loader.h
+# TODO: Change Info.plist for visionOS 1.0
+METHOD_CHANGE_PLAT = \
+	if [ '$(1)' != '11' ] && [ '$(1)' != '12' ]; then \
+		vtool -arch arm64 -set-build-version $(1) 14.0 16.0 -replace -output $(2) $(2); \
+		ldid -S -M $(2); \
+	else \
+		vtool -arch arm64 -set-build-version $(1) 1.0 1.0 -replace -output $(2) $(2); \
+	fi \
+	
 # Function to package the application
 METHOD_PACKAGE = \
 	if [ '$(TROLLSTORE_JIT_ENT)' == '1' ]; then \
@@ -105,10 +154,10 @@ METHOD_PACKAGE = \
 		IPA_SUFFIX=".ipa"; \
 	fi; \
 	if [ '$(SLIMMED_ONLY)' = '0' ]; then \
-		zip --symlinks -r $(OUTPUTDIR)/com.congcq.hynis-$(VERSION)$$IPA_SUFFIX Payload; \
+		zip --symlinks -r $(OUTPUTDIR)/com.congcq.hynis-$(VERSION)-$(PLATFORM_NAME)$$IPA_SUFFIX Payload; \
 	fi; \
 	if [ '$(SLIMMED)' = '1' ] || [ '$(SLIMMED_ONLY)' = '1' ]; then \
-		zip --symlinks -r $(OUTPUTDIR)/com.congcq.hynis.slimmed-$(VERSION)$$IPA_SUFFIX Payload --exclude='Payload/Hynis.app/java_runtimes/*'; \
+		zip --symlinks -r $(OUTPUTDIR)/com.congcq.hynis.slimmed-$(VERSION)-$(PLATFORM_NAME)$$IPA_SUFFIX Payload --exclude='Payload/Hynis.app/java_runtimes/*'; \
 	fi
 
 # Function to download and unpack Java runtimes.
@@ -166,6 +215,7 @@ $(error You need to install lld)
 endif
 endif
 
+ifneq ($(filter sysctl,$(shell sysctl -n hw.logicalcpu)),)
 ifneq ($(call METHOD_DEPCHECK,nproc --version),1)
 ifneq ($(call METHOD_DEPCHECK,gnproc --version),1)
 $(warning Unable to determine number of threads, defaulting to 2.)
@@ -175,6 +225,9 @@ JOBS   ?= $(shell gnproc)
 endif
 else
 JOBS   ?= $(shell nproc)
+endif
+else
+JOBS   ?= $(shell sysctl -n hw.logicalcpu)
 endif
 
 ifndef SDKPATH
@@ -208,16 +261,17 @@ check:
 		$(info $(shell printf "%-20s" "$(v)") = $(value $(v)))) \
 	)
 
-native:
+native: dep_mg dep_gl4metal
 	echo '[Hynis v$(VERSION)] native - start'
 	mkdir -p $(WORKINGDIR)
-	cd $(WORKINGDIR) && cmake . \
+	cd $(WORKINGDIR) && cmake \
 		-DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) \
 		-DCMAKE_CROSSCOMPILING=true \
 		-DCMAKE_SYSTEM_NAME=Darwin \
 		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
 		-DCMAKE_OSX_SYSROOT="$(SDKPATH)" \
 		-DCMAKE_OSX_ARCHITECTURES=arm64 \
+		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
 		-DCMAKE_C_FLAGS="-arch arm64" \
 		-DCONFIG_BRANCH="$(BRANCH)" \
 		-DCONFIG_COMMIT="$(COMMIT)" \
@@ -225,12 +279,13 @@ native:
 		..
 
 	cmake --build $(WORKINGDIR) --config $(CMAKE_BUILD_TYPE) -j$(JOBS)
+	#	--target awt_headless awt_xawt libOSMesaOverride.dylib tinygl4angle Hynis
 	rm $(WORKINGDIR)/libawt_headless.dylib
 	echo '[Hynis v$(VERSION)] native - end'
 
 java:
 	echo '[Hynis v$(VERSION)] java - start'
-	$(MAKE) -C JavaApp -j2 BOOTJDK=$(BOOTJDK)
+	$(MAKE) -C JavaApp -j$(JOBS) BOOTJDK=$(BOOTJDK)
 	echo '[Hynis v$(VERSION)] java - end'
 
 jre: native
@@ -245,15 +300,39 @@ jre: native
 	cd $(SOURCEDIR); \
 	rm -rf $(SOURCEDIR)/depends/java-*-openjdk/{ASSEMBLY_EXCEPTION,bin,include,jre,legal,LICENSE,man,THIRD_PARTY_README,lib/{ct.sym,jspawnhelper,libjsig.dylib,src.zip,tools.jar}}; \
 	$(call METHOD_DIRCHECK,$(OUTPUTDIR)/java_runtimes); \
-	cp -R $(HYNIS_JRE8_DIR) $(OUTPUTDIR)/java_runtimes; \
-	cp -R $(HYNIS_JRE17_DIR) $(OUTPUTDIR)/java_runtimes; \
-	cp -R $(HYNIS_JRE21_DIR) $(OUTPUTDIR)/java_runtimes; \
-	cp -R $(HYNIS_JRE25_DIR) $(OUTPUTDIR)/java_runtimes; \
+	cp -R $(POJAV_JRE8_DIR) $(OUTPUTDIR)/java_runtimes; \
+	cp -R $(POJAV_JRE17_DIR) $(OUTPUTDIR)/java_runtimes; \
+	cp -R $(POJAV_JRE21_DIR) $(OUTPUTDIR)/java_runtimes; \
+	cp -R $(POJAV_JRE25_DIR) $(OUTPUTDIR)/java_runtimes; \
 	cp $(WORKINGDIR)/libawt_xawt.dylib $(OUTPUTDIR)/java_runtimes/java-8-openjdk/lib; \
-	cp $(WORKINGDIR)/libawt_xawt.dylib $(OUTPUTDIR)/java_runtimes/java-17-openjdk/lib; \
-	cp $(WORKINGDIR)/libawt_xawt.dylib $(OUTPUTDIR)/java_runtimes/java-21-openjdk/lib; \
+	cp $(WORKINGDIR)/libawt_xawt.dylib $(OUTPUTDIR)/java_runtimes/java-17-openjdk/lib;
+	cp $(WORKINGDIR)/libawt_xawt.dylib $(OUTPUTDIR)/java_runtimes/java-21-openjdk/lib;
 	cp $(WORKINGDIR)/libawt_xawt.dylib $(OUTPUTDIR)/java_runtimes/java-25-openjdk/lib
 	echo '[Hynis v$(VERSION)] jre - end'
+
+dep_gl4metal:
+	echo '[Hynis v$(VERSION)] dep_gl4metal - start'
+	bash scripts/build_gl4metal.sh "$(GL4METAL_SOURCE_DIR)" "$(CURDIR)/Natives/build" "$(SDKPATH)" "$(CMAKE_BUILD_TYPE)" "$(JOBS)" "$(GL4METAL_LIBRARY)"
+	echo '[Hynis v$(VERSION)] dep_gl4metal - end'
+
+dep_mg:
+	echo '[Hynis v$(VERSION)] dep_mg - start'
+	mkdir -p $(WORKINGDIR)/mobileglues
+	cd $(WORKINGDIR)/mobileglues && cmake \
+		-DMACOS="1" \
+		-DCMAKE_CROSSCOMPILING=true \
+		-DCMAKE_SYSTEM_NAME=Darwin \
+		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+		-DCMAKE_OSX_SYSROOT="$(SDKPATH)" \
+		-DCMAKE_OSX_ARCHITECTURES=arm64 \
+		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+		-DCMAKE_C_FLAGS="-arch arm64" \
+		$(SOURCEDIR)/Natives/external/MobileGlues/src/main/cpp/
+
+	cmake --build $(WORKINGDIR)/mobileglues --config RelWithDebInfo -j$(JOBS) --target mobileglues
+	cp $(WORKINGDIR)/mobileglues/libmobileglues.dylib $(WORKINGDIR)/libmobileglues.dylib
+	cp $(SOURCEDIR)/Natives/external/MobileGlues/src/main/cpp/libraries/ios/libspirv-cross-c-shared.0.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.dylib
+	echo '[Hynis v$(VERSION)] dep_mg - end'
 
 assets:
 	echo '[Hynis v$(VERSION)] assets - start'
@@ -263,17 +342,16 @@ assets:
 			--compile $(SOURCEDIR)/Natives/resources \
 			--platform iphoneos \
 			--minimum-deployment-target 14.0 \
-			--app-icon Chicken \
-			--alternate-app-icon Enderman \
+			--app-icon AppIcon-Light \
 			--output-partial-info-plist /dev/null || exit 1; \
 	else \
 		echo 'Due to the required tools not being available, you cannot compile the extras for Hynis with an iOS device.'; \
 	fi
 	echo '[Hynis v$(VERSION)] assets - end'
 
-payload: native java jre assets
+payload: native dep_mg java jre assets
 	echo '[Hynis v$(VERSION)] payload - start'
-	#$(call METHOD_DIRCHECK,$(WORKINGDIR)/Hynis.app/libs/lwjgl)
+	$(call METHOD_DIRCHECK,$(WORKINGDIR)/Hynis.app/libs)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/Hynis.app/libs_caciocavallo)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/Hynis.app/libs_caciocavallo17)
 	cp -R $(SOURCEDIR)/Natives/resources/en.lproj/LaunchScreen.storyboardc $(WORKINGDIR)/Hynis.app/Base.lproj/ || exit 1
@@ -281,8 +359,6 @@ payload: native java jre assets
 	cp $(WORKINGDIR)/*.dylib $(WORKINGDIR)/Hynis.app/Frameworks/ || exit 1
 	cp -R $(SOURCEDIR)/JavaApp/libs/others/* $(WORKINGDIR)/Hynis.app/libs/ || exit 1
 	cp $(SOURCEDIR)/JavaApp/build/*.jar $(WORKINGDIR)/Hynis.app/libs/ || exit 1
-	#mv $(WORKINGDIR)/Hynis.app/libs/lwjgl-*.jar $(WORKINGDIR)/Hynis.app/libs/lwjgl/ || exit 1
-	rm -rf $(WORKINGDIR)/Hynis.app/libs/lwjgl-*.jar || exit 1
 	cp -R $(SOURCEDIR)/JavaApp/libs/caciocavallo/* $(WORKINGDIR)/Hynis.app/libs_caciocavallo || exit 1
 	cp -R $(SOURCEDIR)/JavaApp/libs/caciocavallo17/* $(WORKINGDIR)/Hynis.app/libs_caciocavallo17 || exit 1
 	$(call METHOD_DIRCHECK,$(OUTPUTDIR)/Payload)
@@ -293,10 +369,16 @@ payload: native java jre assets
 	ldid -S $(OUTPUTDIR)/Payload/Hynis.app; \
 	if [ '$(TROLLSTORE_JIT_ENT)' == '1' ]; then \
 		ldid -S$(SOURCEDIR)/entitlements.trollstore.xml $(OUTPUTDIR)/Payload/Hynis.app/Hynis; \
+	elif [ '$(PLATFORM)' == '6' ]; then \
+		ldid -S$(SOURCEDIR)/entitlements.codesign.xml $(OUTPUTDIR)/Payload/Hynis.app/Hynis; \
 	else \
 		ldid -S$(SOURCEDIR)/entitlements.sideload.xml $(OUTPUTDIR)/Payload/Hynis.app/Hynis; \
 	fi
 	chmod -R 755 $(OUTPUTDIR)/Payload
+	if [ '$(PLATFORM)' != '2' ]; then \
+		$(call METHOD_MACHO,$(OUTPUTDIR)/Payload/Hynis.app,$(call METHOD_CHANGE_PLAT,$(PLATFORM),$$file)); \
+		$(call METHOD_MACHO,$(OUTPUTDIR)/java_runtimes,$(call METHOD_CHANGE_PLAT,$(PLATFORM),$$file)); \
+	fi
 	echo '[Hynis v$(VERSION)] payload - end'
 
 deploy:
@@ -316,9 +398,9 @@ deploy:
 		else \
 			$(call METHOD_PACKAGE); \
 			if [ '$(SLIMMED_ONLY)' = '0' ]; then \
-				open $(OUTPUTDIR)/com.congcq.hyns-$(VERSION).ipa; \
+				open $(OUTPUTDIR)/net.kdt.pojavlauncher-$(VERSION)-$(PLATFORM_NAME).ipa; \
 			else \
-				open $(OUTPUTDIR)/com.congcq.hynis.slimmed-$(VERSION).ipa; \
+				open $(OUTPUTDIR)/net.kdt.pojavlauncher.slimmed-$(VERSION)-$(PLATFORM_NAME).ipa; \
 			fi; \
 		fi; \
 	else \
@@ -353,6 +435,7 @@ codesign:
 	$(call METHOD_MACHO,$(OUTPUTDIR)/Payload/Hynis.app,$(call METHOD_CODESIGN,$(SIGNING_TEAMID),$$file))
 	$(call METHOD_MACHO,$(OUTPUTDIR)/java_runtimes,$(call METHOD_CODESIGN,$(SIGNING_TEAMID),$$file))
 	echo '[Hynis v$(VERSION)] codesign - end'
+
 clean:
 	echo '[Hynis v$(VERSION)] clean - start'
 	rm -rf $(WORKINGDIR)
@@ -362,4 +445,4 @@ clean:
 
 		
 
-.PHONY: all clean check native java jre package dsym deploy help
+.PHONY: all clean check native java jre package dsym deploy help dep_gl4metal dep_mg

@@ -1,0 +1,11 @@
+{
+  "repository": "congcq/gl4metal",
+  "base_commit": "38c5c2c29c6e05a528f595ac616161017f5eb9e9",
+  "patch": "custom-resources.patch",
+  "sha256": "1f6c54398dacbf9afd760c585e210a8b89589bcb3e33c4886285627a2ba61be3",
+  "features": [
+    "3D shader images",
+    "shader storage buffers (SSBOs)",
+    "compute programs"
+  ]
+}

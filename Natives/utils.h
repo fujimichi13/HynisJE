@@ -35,8 +35,10 @@
 #define GLFW_VISIBLE 0x00020004
 
 #define RENDERER_NAME_GL4ES "libgl4es_114.dylib"
-#define RENDERER_NAME_LTW "libLTW.dylib"
+#define RENDERER_NAME_GL4METAL "libgl4metal.dylib"
 #define RENDERER_NAME_MTL_ANGLE "libtinygl4angle.dylib"
+#define RENDERER_NAME_LTW "libLTW.dylib"
+#define RENDERER_NAME_MOBILEGL "libMobileGL.dylib"
 #define RENDERER_NAME_MOBILEGLUES "libmobileglues.dylib"
 #define RENDERER_NAME_VK_ZINK "libOSMesa.8.dylib"
 
@@ -58,6 +60,25 @@ BOOL debugLogEnabled, isJailbroken;
 #define CS_DEBUGGED 0x10000000
 int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 BOOL isJITEnabled(BOOL checkCSOps);
+// legacy method used to check if we're using universal script
+void* JIT26CreateRegionLegacy(size_t len);
+// used for large memory regions
+void* JIT26PrepareRegion(void *addr, size_t len);
+// same as JIT26PrepareRegion, but used for smaller memory regions
+// and retain content instead of filling 0x69
+void JIT26PrepareRegionForPatching(void *addr, size_t len);
+void JIT26SetDetachAfterFirstBr(BOOL value);
+void JIT26SendJITScript(NSString* script);
+BOOL JIT26IsLikelyDebuggerKeepAttached(void);
+
+// Device JIT flags
+typedef enum {
+    JIT_FLAG_IS_IOS_26 = 1 << 0,
+    JIT_FLAG_FORCE_MIRRORED = 1 << 1,
+    JIT_FLAG_HAS_TXM = 1 << 2,
+} JITFlags;
+JITFlags DeviceGetJITFlags(BOOL refresh);
+BOOL DeviceHasJITFlags(JITFlags flags);
 
 // Init functions
 void init_bypassDyldLibValidation();
@@ -69,6 +90,7 @@ BOOL PLPatchMachOPlatformForFile(const char *path);
 
 UIViewController* currentVC();
 void openLink(UIViewController* sender, NSURL* link);
+void handle_fatal_exit(int code);
 
 NSString* localize(NSString* key, NSString* comment);
 NSMutableDictionary* parseJSONFromFile(NSString *path);

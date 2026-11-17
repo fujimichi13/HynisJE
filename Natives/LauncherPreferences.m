@@ -137,8 +137,10 @@ NSArray* getRendererKeys(BOOL containsDefault) {
     NSMutableArray *array = @[
         @"auto",
         @ RENDERER_NAME_GL4ES,
-        @ RENDERER_NAME_LTW,
+        @ RENDERER_NAME_GL4METAL,
         @ RENDERER_NAME_MTL_ANGLE,
+        @ RENDERER_NAME_LTW,
+        @ RENDERER_NAME_MOBILEGL,
         @ RENDERER_NAME_MOBILEGLUES,
         @ RENDERER_NAME_VK_ZINK
     ].mutableCopy;
@@ -146,7 +148,7 @@ NSArray* getRendererKeys(BOOL containsDefault) {
     if (containsDefault) {
         [array insertObject:@"(default)" atIndex:0];
     }
-
+    
     return array;
 }
 
@@ -156,26 +158,14 @@ NSArray* getRendererNames(BOOL containsDefault) {
     array = @[
         localize(@"preference.title.renderer.debug.auto", nil),
         localize(@"preference.title.renderer.debug.gl4es", nil),
-        localize(@"preference.title.renderer.debug.ltw", nil),
+        localize(@"preference.title.renderer.debug.gl4metal", nil),
         localize(@"preference.title.renderer.debug.angle", nil),
-        localize(@"preference.title.renderer.debug.mobileglues", nil),
+        localize(@"preference.title.renderer.debug.ltw", nil),
+        localize(@"preference.title.renderer.debug.mobilegl", nil),
+        localize(@"preference.title.renderer.debug.mg", nil),
         localize(@"preference.title.renderer.debug.zink", nil)
     ].mutableCopy;
-    if (containsDefault) {
-        [array insertObject:@"(default)" atIndex:0];
-    }
 
-    return array;
-}
-
-#pragma mark - Lwjgl
-
-NSArray* getLwjglVersions(BOOL containsDefault) {
-    NSMutableArray *array = @[
-        @"3.3.3",
-        @"3.3.6",
-        @"3.4.1"
-    ].mutableCopy;
     if (containsDefault) {
         [array insertObject:@"(default)" atIndex:0];
     }

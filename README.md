@@ -1,6 +1,6 @@
 # Hynis iOS
-[![Development build](https://github.com/congcq/Hynis/actions/workflows/development.yml/badge.svg?branch=main)](https://github.com/congcq/PojavLauncher-iOS-Patch/actions/workflows/development.yml)
-[![Discord](https://img.shields.io/discord/724163890803638273.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2)](https://discord.gg/nUpEeqRBqR)
+[![Development build](https://github.com/congcq/Hynis-JE/actions/workflows/development.yml/badge.svg?branch=main)](https://github.com/congcq/Hynis-JE/actions/workflows/development.yml)
+[![Discord](https://img.shields.io/discord/724163890803638273.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2)](https://discord.gg/cbgz)
 
 
 
@@ -32,7 +32,7 @@ However, we recommend one of the following devices on **iOS 14.0** and later:
 
 Recommended devices provide a smoother and more enjoyable gameplay experience compared to other supported devices.
 - iOS 17.x and iOS 18.x is supported. However, a computer is required.
-- iOS 26 is currently supported.
+- iOS 26, 27 is currently supported. Note that on iOS 27, you can install SideStore without pc/laptop.
 
 ### Setting up to sideload
 Hynis can be sideloaded in many ways. Our recommended solution is to install [TrollStore](https://github.com/opa334/TrollStore) if your iOS version supports it. Installing with TrollStore allows you to permenantly sign the application, automatically enable JIT, and increase memory limits.
@@ -47,12 +47,12 @@ If you cannot, [AltStore](https://altstore.io) and [SideStore](https://sidestore
 
 ### Installing Hynis
 #### Release build (both TrollStore and AltStore/SideStore)
-1. Download an IPA of Hynis in [Releases](https://github.com/congcq/Hynis/releases).
+1. Download an IPA of Hynis in [Releases](https://github.com/congcq/Hynis-JE/releases).
 2. Open the package in TrollStore using the share menu.
 
 #### Nightly builds
 *These builds can contain game-breaking bugs. Use with caution.*
-1. Download an IPA build of Hynis in the [Actions tab](https://github.com/congcq/Hynis/actions).
+1. Download an IPA build of Hynis in the [Actions tab](https://github.com/congcq/Hynis-JE/actions).
 2. Open the downloaded IPA in your sideloading app to install.
 
 ### Enabling JIT
@@ -65,6 +65,12 @@ Hynis makes use of **just-in-time compilation**, or JIT, to provide usable speed
 
 (*) AltServer running on the local network is required.
 
+### gl4metal renderer
+
+Hynis can build and package gl4metal as a direct Metal renderer. See the
+[build, configuration and testing instructions](docs/gl4metal.md), including how
+to use a modified gl4metal checkout or a prebuilt dylib.
+
 ## Contributors
 
 @congcq - Hynis's developer  
@@ -74,7 +80,7 @@ Hynis makes use of **just-in-time compilation**, or JIT, to provide usable speed
 @Mathius-Boulay  
 @zhuowei  
 @jkcoxson   
-@Diatrus   
+@Diatrus 
 
 ## Third party components and their licenses
 - [Caciocavallo](https://github.com/PojavLauncherTeam/caciocavallo): [GNU GPLv2 License](https://github.com/PojavLauncherTeam/caciocavallo/blob/master/LICENSE).
@@ -88,7 +94,6 @@ Hynis makes use of **just-in-time compilation**, or JIT, to provide usable speed
 - [Azul Zulu JDK](https://www.azul.com/downloads/?package=jdk): [GNU GPLv2 License](https://openjdk.java.net/legal/gplv2+ce.html).
 - [LWJGL3](https://github.com/PojavLauncherTeam/lwjgl3): [BSD-3 License](https://github.com/LWJGL/lwjgl3/blob/master/LICENSE.md).
 - [LWJGLX](https://github.com/PojavLauncherTeam/lwjglx) (LWJGL2 API compatibility layer for LWJGL3): unknown license.
-- [DayNightSwitch](https://github.com/finngaida/DayNightSwitch): [MIT License](https://github.com/finngaida/DayNightSwitch/blob/master/LICENSE)
 - [DBNumberedSlider](https://github.com/khanhduytran0/DBNumberedSlider): [Apache 2.0 License](https://github.com/immago/DBNumberedSlider/blob/master/LICENSE)
 - [fishhook](https://github.com/khanhduytran0/fishhook): [BSD-3 License](https://github.com/facebook/fishhook/blob/main/LICENSE).
 - [shaderc](https://github.com/khanhduytran0/shaderc) (used by Vulkan rendering mods): [Apache 2.0 License](https://github.com/google/shaderc/blob/main/LICENSE).
@@ -97,5 +102,3 @@ Hynis makes use of **just-in-time compilation**, or JIT, to provide usable speed
 - [UnzipKit](https://github.com/abbeycode/UnzipKit): [BSD-2 License](https://github.com/abbeycode/UnzipKit/blob/master/LICENSE).
 - [DyldDeNeuralyzer](https://github.com/xpn/DyldDeNeuralyzer): bypasses Library Validation for loading external runtime
 - Thanks to [MCHeads](https://mc-heads.net) for providing Minecraft avatars.
-
-<!-- sillysock was here -->

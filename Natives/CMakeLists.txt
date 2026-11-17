@@ -3,12 +3,7 @@ project(Hynis)
 
 configure_file(${CMAKE_CURRENT_LIST_DIR}/config.h.in ${CMAKE_CURRENT_LIST_DIR}/config.h)
 
-# Using our build system, cmake doesn't respect -miphoneos-version-min=14.0
-# and instead overrides it with the macOS SDK version when compiled
-# in Xcode on a Mac.
-set(CMAKE_OSX_DEPLOYMENT_TARGET 14.0)
-
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -target arm64-apple-ios -fcommon -fobjc-arc -ObjC -F'${CMAKE_OSX_SYSROOT}/System/Cryptexes/OS/System/Library/Frameworks'")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -target arm64-apple-ios -mcpu=apple-a8 -fcommon -fobjc-arc -ObjC -F'${CMAKE_OSX_SYSROOT}/System/Cryptexes/OS/System/Library/Frameworks'")
 set(CMAKE_C_FLAGS_DEBUG "-funwind-tables -g")
 
 if("${CMAKE_HOST_SYSTEM_NAME}" MATCHES "Linux|^GNU$|Android")
@@ -19,7 +14,6 @@ endif()
 
 include_directories(
   "."
-  "external/DayNightSwitch"
   "external/AFNetworking/AFNetworking"
   "external/AFNetworking/UIKit+AFNetworking"
   "external/DBNumberedSlider/Classes"
@@ -32,6 +26,7 @@ include_directories(
   "external/Apple"
   "external/ballpa1n"
   "external/ballpa1n/wrapped"
+  "external/mach"
 )
 
 # For cacio support library
@@ -112,6 +107,7 @@ add_executable(Hynis
   authenticator/MicrosoftAuthenticator.m
 
   ctxbridges/gl_bridge.m
+  ctxbridges/gl4metal_bridge.m
   ctxbridges/osm_bridge.m
  
   customcontrols/ControlButton.m
@@ -122,11 +118,11 @@ add_executable(Hynis
   customcontrols/CustomControlsUtils.m
   customcontrols/NSPredicateUtilitiesExternal.m
 
-  external/DayNightSwitch/DayNightSwitch.m
   external/DBNumberedSlider/Classes/DBNumberedSlider.m
   external/NRFileManager/NSFileManager+NRFileManager.m
   external/ballpa1n/HostManager.c
   external/ballpa1n/wrapped/HostManagerBridge.m
+  external/mach/mach_excServer.c
 
   installer/FabricInstallViewController.m
   installer/ForgeInstallViewController.m
@@ -160,6 +156,7 @@ add_executable(Hynis
   LauncherProfileEditorViewController.m
   LauncherProfilesViewController.m
   LauncherSplitViewController.m
+  MinecraftOptionUtils.m
   MinecraftResourceDownloadTask.m
   MinecraftResourceUtils.m
   PickTextField.m

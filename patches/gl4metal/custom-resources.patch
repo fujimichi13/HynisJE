@@ -1,0 +1,2836 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1560dcd2be6018643a020419630a70fd6ab409b5..3b0d5bd2f891027287cba9ce47f16a4e714bcf6e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,6 +1,9 @@
+-cmake_minimum_required(VERSION 3.10)
++cmake_minimum_required(VERSION 3.22.1)
+ project(gl4metal)
+ 
++option(GL4METAL_TRANSLATOR_TESTS_ONLY "Build portable GLSL translation tests without the Apple runtime" OFF)
++option(GL4METAL_GPU_TESTS "Include gl4metalRunResourceTests for opt-in iOS device testing" OFF)
++
+ set(CMAKE_CXX_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_CXX_EXTENSIONS OFF)
+@@ -21,6 +24,17 @@ set(SPIRV_CROSS_ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+ set(SPIRV_CROSS_ENABLE_MSL ON CACHE BOOL "" FORCE)
+ add_subdirectory(external/SPIRV-Cross)
+ 
++if(GL4METAL_TRANSLATOR_TESTS_ONLY)
++    enable_testing()
++    add_executable(translator_tests tests/translator_tests.cpp gl4metal/shadertranslator.cpp)
++    target_compile_definitions(translator_tests PRIVATE NOMINMAX)
++    target_include_directories(translator_tests PRIVATE include external external/SPIRV-Cross gl4metal)
++    target_link_libraries(translator_tests PRIVATE glslang::glslang glslang-default-resource-limits
++        spirv-cross-msl spirv-cross-glsl spirv-cross-core)
++    add_test(NAME translator_resources COMMAND translator_tests)
++    return()
++endif()
++
+ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -target arm64-apple-ios -fcommon -fobjc-arc -ObjC -F'${CMAKE_OSX_SYSROOT}/System/Cryptexes/OS/System/Library/Frameworks'")
+ set(CMAKE_C_FLAGS_DEBUG "-funwind-tables -g")
+ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fobjc-arc -fPIC -stdlib=libc++")
+@@ -83,4 +97,8 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
+     "-framework Metal"
+     "-framework QuartzCore"
+     "-framework UIKit"
+-)
+\ No newline at end of file
++)
++
++if(GL4METAL_GPU_TESTS)
++    target_sources(${CMAKE_PROJECT_NAME} PRIVATE tests/gpu_resource_tests.mm)
++endif()
+diff --git a/README.md b/README.md
+index a4bbd16cee08fb1a366d90122f7749de776a35a1..fdbe69584834d80effdd03329cbe538cdaafcb98 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,10 @@
+ # gl4metal
+ 
+ gl4metal is a desktop OpenGL 3.3 Core Profile implementation on iOS with Metal backend, which doesn't use ANGLE's EGL, OpenGLES framework or MoltenVK.
+-This repo is not finished yet. It's still missing many GL functions.
+\ No newline at end of file
++This repo is not finished yet. It's still missing many GL functions.
++
++The image/compute resource path supports 2D and layered 3D shader images,
++integer texture transfers, immutable 2D/3D storage, SSBO layout reflection and
++ranged bindings, and direct/indirect compute dispatch. See
++[resource support and testing](docs/shader-resources.md) for the supported API,
++device requirements, remaining limitations, and regression tests.
+diff --git a/docs/shader-resources.md b/docs/shader-resources.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..60607f526603679a33236fa72d7164688f4efe26
+--- /dev/null
++++ b/docs/shader-resources.md
+@@ -0,0 +1,129 @@
++# Custom images, SSBOs and compute programs
++
++This backend implements these resource paths through Metal. It is not a claim of
++complete OpenGL 4.3 conformance.
++
++## Supported paths
++
++- `image2D`, `iimage2D`, `uimage2D`, `image3D`, `iimage3D`, and `uimage3D`,
++  including arrays of image uniforms, in vertex, fragment and compute programs.
++  Image uniforms participate in active-uniform queries and `glUniform1i/1iv`.
++  GLSL constant expressions and macros in `layout(binding=...)` are preserved.
++- `glBindImageTexture` resolves the current texture allocation when drawing or
++  dispatching. A binding may precede allocation. A nonzero mip selects a
++  single-level Metal view, so shader image coordinates and `imageSize` refer to
++  that mip. Use `layered=GL_TRUE` for `image3D`.
++- Signed/unsigned R, RG and RGBA integer textures with 8-, 16- and 32-bit
++  components. Uploads, clears and readback preserve all 32 bits, support integer
++  width conversion and use `GL_*_INTEGER` external formats. Pixel-store row/image
++  strides, skips, alignment and byte swapping apply to transfers.
++- `glTexStorage2D` for 2D/cube textures and `glTexStorage3D` for 3D textures,
++  with immutable format/level queries. `glTexSubImage*` can populate the storage;
++  `glTexImage*` cannot redefine it. Mutable texture allocation remains available.
++- SSBOs in graphics and compute programs: `std430`/`std140` layouts, scalar,
++  vector and matrix members, nested structures/arrays, runtime tails,
++  read/write access and atomics. Program-resource queries expose leaf member
++  offsets, matrix/array strides and top-level array metadata. Anonymous block
++  members omit the block-name prefix.
++- `glBindBufferBase`, `glBindBufferRange`, `glShaderStorageBlockBinding` and
++  runtime-array `.length()` using the bound range. `GL_BUFFER_DATA_SIZE` includes
++  one runtime-tail element; range validation allows a zero-element tail.
++- Buffer allocation, subdata, copy, clear, readback and nonpersistent mapping.
++  Partial CPU updates wait for preceding GPU uses so untouched SSBO bytes retain
++  GPU writes. Whole-store replacement can rename the allocation. Mapping queries
++  report the actual range, flags and pointer; `glBufferData` implicitly unmaps.
++- Compute compilation diagnostics, link-time local-size validation, 3D dispatch,
++  shared memory, barriers, `gl_NumWorkGroups`, and GPU-generated indirect dispatch
++  arguments. Compute and render encoders are ordered through the same command
++  queue. `glMemoryBarrier` ends the active encoder to establish visibility for
++  subsequent commands; synchronized CPU access also waits for completion.
++
++Example of a 3D compute image and ranged SSBO:
++
++```glsl
++#version 430
++layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
++layout(r32ui, binding=0) uniform uimage3D volume;
++layout(std430, binding=1) buffer Output { uint values[]; } outputData;
++
++void main() {
++    ivec3 p = ivec3(gl_GlobalInvocationID);
++    if (any(greaterThanEqual(p, imageSize(volume)))) return;
++    uint value = imageLoad(volume, p).x + 1u;
++    imageStore(volume, p, uvec4(value));
++    ivec3 size = imageSize(volume);
++    uint index = uint(p.x + size.x * (p.y + size.y * p.z));
++    if (index < uint(outputData.values.length())) outputData.values[index] = value;
++}
++```
++
++```cpp
++glBindTexture(GL_TEXTURE_3D, texture);
++glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32UI, width, height, depth);
++glClearTexImage(texture, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
++glBindImageTexture(0, texture, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
++glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, buffer, offset, size);
++glUseProgram(computeProgram);
++glDispatchCompute((width + 3) / 4, (height + 3) / 4, (depth + 3) / 4);
++glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
++```
++
++## Device requirements and limits
++
++The existing compute capability gate requires Apple GPU family 6 or newer, at
++least 32 KiB threadgroup memory, and the exposed workgroup limits. Query the
++`GL_MAX_COMPUTE_*`, SSBO and image limits rather than assuming desktop limits.
++Vertex/fragment images share each stage's 32 Metal texture slots with samplers.
++
++Native image atomics require iOS 17+, Apple GPU family 6+, and R32I/R32UI storage.
++These devices use MSL 3.1. Older supported configurations use MSL 2.2, and
++programs needing an auxiliary buffer for emulated image atomics fail linking
++with an explanation. SSBO/shared-memory atomics do not require texture atomics.
++
++Remaining limitations:
++
++- Storage images are non-multisampled 2D or layered 3D. Array/cube/buffer images
++  and an individual 3D slice bound as `image2D` are not implemented.
++- Image views use `GL_IMAGE_FORMAT_COMPATIBILITY_BY_CLASS`, and Metal must also
++  accept the requested pixel-format view. Image signedness, access mode, declared
++  format, dimensions and mip are validated before encoding a draw/dispatch.
++  Use matching R32I/R32UI storage for image atomics.
++- Persistent/coherent buffer mappings, arrays of SSBO blocks, atomic-counter
++  buffers and separate program pipelines are outside this implementation.
++- Existing packed-color texture upload restrictions remain. The integer transfer
++  path described above uses scalar byte/short/int types, not packed integer types.
++- CPU tests and native compilation cannot establish Metal execution correctness;
++  run the device test below before relying on a particular iOS/GPU combination.
++
++## Tests
++
++Initialize the pinned submodules, then run the portable tests on Windows, macOS
++or Linux with a C++17 compiler and CMake 3.22.1 or newer:
++
++```sh
++git submodule update --init --recursive
++cmake -S . -B build/tests -DGL4METAL_TRANSLATOR_TESTS_ONLY=ON -DCMAKE_BUILD_TYPE=Release
++cmake --build build/tests --config Release --target translator_tests --parallel
++ctest --test-dir build/tests -C Release --output-on-failure
++```
++
++The tests run glslang and SPIRV-Cross, checking image types/bindings, per-stage
++slots, nested SSBO reflection, runtime lengths, workgroup built-ins and native
++atomics. Passing an output directory to `translator_tests` writes MSL fixtures.
++CI compiles those fixtures with Apple's Metal compiler and builds the iOS library
++with the optional device test enabled.
++
++To test on a device, add `-DGL4METAL_GPU_TESTS=ON` to the normal iOS build, load the
++library, and call the exported function on the GL submission thread in a fresh
++context before application rendering:
++
++```cpp
++extern "C" int gl4metalRunResourceTests();
++int result = gl4metalRunResourceTests(); // 0: passed, 1: failed, 77: unsupported
++```
++
++This opt-in test changes GL bindings and deletes its own objects. It verifies
++immutable 3D mips, exact integer upload/readback, ranged SSBO writes and clears,
++preservation of GPU writes during a partial CPU update, GPU-generated indirect
++dispatch, mapped-range queries/errors, and image/SSBO/shared-memory atomics on
++iOS 17+. Failures are reported through `GL4METAL_LOG`.
+diff --git a/gl4metal/buffers.mm b/gl4metal/buffers.mm
+index 39594da6ae27b9a1fbe34860f0877e5c586e4420..a5bcd8e1ad6bb2c489b82b530ad16a18790bae60 100644
+--- a/gl4metal/buffers.mm
++++ b/gl4metal/buffers.mm
+@@ -9,6 +9,7 @@
+ 
+ #import "sync.h"
+ #import "texture.h"
++#include "imageformats.h"
+ 
+ 
+ // MARK: - Buffer objects
+@@ -73,8 +74,17 @@ static bool bufferHasPendingGPUUse(GLuint buf_id) {
+ 	return false;
+ }
+ 
++static void waitForBufferGPUUse(GLuint buf_id);
++
+ static bool makeBufferWritableWithoutStall(GLuint buf_id, __strong id<MTLBuffer> &buffer, bool preserveContents = true) {
+ 	if (!bufferHasPendingGPUUse(buf_id)) return true;
++	// SSBOs can be GPU writers, not just readers. Copying an in-flight shared
++	// allocation on the CPU would lose pending shader writes in untouched ranges.
++	if (preserveContents) {
++		waitForBufferGPUUse(buf_id);
++		buffer = ctx.buffer_objects[buf_id];
++		return true;
++	}
+ 	if (!ctx.device || !buffer || buffer.length > ctx.device.maxBufferLength) {
+ 		gl4metalSetError(GL_OUT_OF_MEMORY);
+ 		return false;
+@@ -87,9 +97,6 @@ static bool makeBufferWritableWithoutStall(GLuint buf_id, __strong id<MTLBuffer>
+ 			buf_id, (unsigned long long)buffer.length);
+ 		return false;
+ 	}
+-	if (preserveContents && buffer.length != 0) {
+-		memcpy(replacement.contents, buffer.contents, (size_t)buffer.length);
+-	}
+ 	ctx.buffer_objects[buf_id] = replacement;
+ 	ctx.buffer_last_use.erase(buf_id);
+ 	buffer = replacement;
+@@ -227,6 +234,8 @@ void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
+ 		invalidateConvertedVertexBuffers(buf_id);
+ 		ctx.buffer_last_use.erase(buf_id);
+ 		ctx.buffer_objects.erase(buf_id);
++		ctx.buffer_mappings.erase(buf_id);
++		ctx.buffer_usages.erase(buf_id);
+ 		gl4metalEraseBufferLogicalSize(buf_id);
+ 
+ 	}
+@@ -401,7 +410,9 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
+ 		}
+ 		invalidateConvertedVertexBuffers(buf_id);
+ 		ctx.buffer_last_use.erase(buf_id);
++		ctx.buffer_mappings.erase(buf_id);
+ 		gl4metalSetBufferLogicalSize(buf_id, (NSUInteger)size);
++		ctx.buffer_usages[buf_id] = usage;
+ 		refreshTextureBufferViews(buf_id);
+ 		return;
+ 	}
+@@ -423,7 +434,9 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
+ 	invalidateConvertedVertexBuffers(buf_id);
+ 	ctx.buffer_last_use.erase(buf_id);
+ 	ctx.buffer_objects[buf_id] = buffer;
++	ctx.buffer_mappings.erase(buf_id);
+ 	gl4metalSetBufferLogicalSize(buf_id, (NSUInteger)size);
++	ctx.buffer_usages[buf_id] = usage;
+ 	refreshTextureBufferViews(buf_id);
+ }
+ 
+@@ -433,6 +446,7 @@ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void
+ 		return;
+ 	}
+ 	GLuint buf_id = boundBuffer(target);
++	if (ctx.buffer_mappings.count(buf_id)) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+ 	auto it = ctx.buffer_objects.find(buf_id);
+ 	if (buf_id == 0 || it == ctx.buffer_objects.end() || !it->second) {
+ 		gl4metalSetError(GL_INVALID_OPERATION);
+@@ -465,6 +479,7 @@ void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *d
+ 		return;
+ 	}
+ 	GLuint buf_id = boundBuffer(target);
++	if (ctx.buffer_mappings.count(buf_id)) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+ 	auto it = ctx.buffer_objects.find(buf_id);
+ 	if (buf_id == 0 || it == ctx.buffer_objects.end() || !it->second) {
+ 		gl4metalSetError(GL_INVALID_OPERATION);
+@@ -495,9 +510,14 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOff
+ 		gl4metalSetError(GL_INVALID_ENUM);
+ 		return;
+ 	}
++	if (ctx.buffer_mappings.count(boundBuffer(readTarget)) || ctx.buffer_mappings.count(boundBuffer(writeTarget))) {
++		gl4metalSetError(GL_INVALID_OPERATION); return;
++	}
++
+ 	auto src = ctx.buffer_objects.find(boundBuffer(readTarget));
+ 	auto dst = ctx.buffer_objects.find(boundBuffer(writeTarget));
+ 	if (src == ctx.buffer_objects.end() || dst == ctx.buffer_objects.end() || !src->second || !dst->second) {
++		gl4metalSetError(GL_INVALID_OPERATION);
+ 		GL4METAL_LOG("glCopyBufferSubData: both targets need a buffer with storage");
+ 		return;
+ 	}
+@@ -519,10 +539,10 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOff
+ 			return;
+ 		}
+ 	}
+-	// Shared storage: a CPU copy. If the destination is still referenced by GPU work,
+-	// rename it instead of serializing the full command queue. `from` remains the prior
+-	// version when readTarget and writeTarget name the same object.
++	// Wait for GPU writers before reading either store on the CPU. Untouched
++	// destination bytes must preserve all preceding shader writes as well.
+ 	if (size > 0) {
++		waitForBufferGPUUse(boundBuffer(readTarget));
+ 		GLuint destinationName = boundBuffer(writeTarget);
+ 		if (!makeBufferWritableWithoutStall(destinationName, to)) return;
+ 		invalidateConvertedVertexBuffers(destinationName);
+@@ -533,112 +553,131 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOff
+ // MARK: - Mapping
+ 
+ void *glMapBuffer(GLenum target, GLenum access) {
+-	if (!isBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return NULL; }
+-	if (access != GL_READ_ONLY && access != GL_WRITE_ONLY && access != GL_READ_WRITE) { gl4metalSetError(GL_INVALID_ENUM); return NULL; }
+-	GLuint buf_id = boundBuffer(target);
+-	auto it = ctx.buffer_objects.find(buf_id);
+-	if (buf_id == 0 || it == ctx.buffer_objects.end() || !it->second) {
+-		gl4metalSetError(GL_INVALID_OPERATION);
+-		GL4METAL_LOG("glMapBuffer: no buffer storage bound to target 0x%X", target);
+-		return NULL;
+-	}
+-	id<MTLBuffer> buffer = it->second;
+-	if (access == GL_READ_ONLY || access == GL_READ_WRITE) {
+-		waitForBufferGPUUse(buf_id);
+-	} else if (!makeBufferWritableWithoutStall(buf_id, buffer)) {
+-		return NULL;
++	if (!isBufferTarget(target) || (access != GL_READ_ONLY && access != GL_WRITE_ONLY && access != GL_READ_WRITE)) {
++		gl4metalSetError(GL_INVALID_ENUM); return nullptr;
+ 	}
+-	invalidateConvertedVertexBuffers(buf_id);
+-	return buffer.contents; // shared storage: the buffer is the CPU pointer itself
++	const GLbitfield bits = access == GL_READ_ONLY ? GL_MAP_READ_BIT :
++		access == GL_WRITE_ONLY ? GL_MAP_WRITE_BIT : GL_MAP_READ_BIT | GL_MAP_WRITE_BIT;
++	return glMapBufferRange(target, 0, (GLsizeiptr)glBufferLogicalSize(boundBuffer(target)), bits);
+ }
+ 
+ void *glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+-	if (!isBufferTarget(target)) {
+-		gl4metalSetError(GL_INVALID_ENUM);
+-		return NULL;
+-	}
+-	GLuint buf_id = boundBuffer(target);
+-	auto it = ctx.buffer_objects.find(buf_id);
+-	if (buf_id == 0 || it == ctx.buffer_objects.end() || !it->second) {
+-		gl4metalSetError(GL_INVALID_OPERATION);
+-		GL4METAL_LOG("glMapBufferRange: no buffer bound to target 0x%X", target);
+-		return NULL;
+-	}
+-	id<MTLBuffer> buffer = it->second;
+-	const NSUInteger logicalLength = glBufferLogicalSize(buf_id);
+-	if (offset < 0 || length < 0 || (NSUInteger)offset > logicalLength || (NSUInteger)length > logicalLength - (NSUInteger)offset) {
+-		gl4metalSetError(GL_INVALID_VALUE);
+-		GL4METAL_LOG("glMapBufferRange: range %ld+%ld outside %lu-byte buffer", (long)offset, (long)length, (unsigned long)buffer.length);
+-		return NULL;
+-	}
+-	if (access & GL_MAP_READ_BIT) {
+-		waitForBufferGPUUse(buf_id);
+-		buffer = ctx.buffer_objects[buf_id];
+-	} else if (!makeBufferWritableWithoutStall(buf_id, buffer,
+-		(access & GL_MAP_INVALIDATE_BUFFER_BIT) == 0)) {
+-		return NULL;
+-	}
+-	invalidateConvertedVertexBuffers(buf_id);
++	if (!isBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return nullptr; }
++	constexpr GLbitfield valid = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT |
++		GL_MAP_INVALIDATE_BUFFER_BIT | GL_MAP_FLUSH_EXPLICIT_BIT | GL_MAP_UNSYNCHRONIZED_BIT;
++	if (offset < 0 || length < 0 || (access & ~valid)) { gl4metalSetError(GL_INVALID_VALUE); return nullptr; }
++	const GLuint name = boundBuffer(target);
++	auto found = ctx.buffer_objects.find(name);
++	if (!name || found == ctx.buffer_objects.end() || !found->second || ctx.buffer_mappings.count(name) ||
++		length == 0 || !(access & (GL_MAP_READ_BIT | GL_MAP_WRITE_BIT)) ||
++		((access & GL_MAP_READ_BIT) && (access & (GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT | GL_MAP_UNSYNCHRONIZED_BIT))) ||
++		((access & GL_MAP_FLUSH_EXPLICIT_BIT) && !(access & GL_MAP_WRITE_BIT))) {
++		gl4metalSetError(GL_INVALID_OPERATION); return nullptr;
++	}
++	const NSUInteger size = glBufferLogicalSize(name);
++	if ((NSUInteger)offset > size || (NSUInteger)length > size - (NSUInteger)offset) {
++		gl4metalSetError(GL_INVALID_VALUE); return nullptr;
++	}
++	id<MTLBuffer> buffer = found->second;
++	if (!(access & GL_MAP_UNSYNCHRONIZED_BIT)) {
++		if (access & GL_MAP_READ_BIT) waitForBufferGPUUse(name);
++		else if (!makeBufferWritableWithoutStall(name, buffer, !(access & GL_MAP_INVALIDATE_BUFFER_BIT))) return nullptr;
++	}
++	ctx.buffer_mappings[name] = {offset, length, access};
++	invalidateConvertedVertexBuffers(name);
+ 	return (uint8_t *)buffer.contents + offset;
+ }
+ 
+ void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
+ 	if (!isBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+-	GLuint buf_id = boundBuffer(target);
+-	auto it = ctx.buffer_objects.find(buf_id);
+-	if (buf_id == 0 || it == ctx.buffer_objects.end() || !it->second) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+-	const NSUInteger logicalLength = glBufferLogicalSize(buf_id);
+-	if (offset < 0 || length < 0 || (NSUInteger)offset > logicalLength || (NSUInteger)length > logicalLength - (NSUInteger)offset) {
++	const GLuint name = boundBuffer(target);
++	auto mapping = ctx.buffer_mappings.find(name);
++	if (!name || mapping == ctx.buffer_mappings.end() || !(mapping->second.access & GL_MAP_FLUSH_EXPLICIT_BIT)) {
++		gl4metalSetError(GL_INVALID_OPERATION); return;
++	}
++	// Flush offsets are relative to the mapped range, not the beginning of the store.
++	if (offset < 0 || length < 0 || offset > mapping->second.length || length > mapping->second.length - offset) {
+ 		gl4metalSetError(GL_INVALID_VALUE); return;
+ 	}
+-	// Shared storage is coherent on Apple GPUs; invalidate cached repacks after CPU writes.
+-	invalidateConvertedVertexBuffers(buf_id);
++	invalidateConvertedVertexBuffers(name);
+ }
+ 
+ GLboolean glUnmapBuffer(GLenum target) {
+ 	if (!isBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return GL_FALSE; }
+-	GLuint buf_id = boundBuffer(target);
+-	if (buf_id == 0 || ctx.buffer_objects.find(buf_id) == ctx.buffer_objects.end() || !ctx.buffer_objects[buf_id]) { gl4metalSetError(GL_INVALID_OPERATION); return GL_FALSE; }
+-	invalidateConvertedVertexBuffers(buf_id);
++	const GLuint name = boundBuffer(target);
++	if (!ctx.buffer_mappings.erase(name)) { gl4metalSetError(GL_INVALID_OPERATION); return GL_FALSE; }
++	invalidateConvertedVertexBuffers(name);
+ 	return GL_TRUE;
+ }
+ 
++void glClearBufferSubData(GLenum target, GLenum internalformat, GLintptr offset, GLsizeiptr size,
++	GLenum format, GLenum type, const void *data) {
++	if (!isBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
++	const GLuint name = boundBuffer(target);
++	auto found = ctx.buffer_objects.find(name);
++	if (!name || found == ctx.buffer_objects.end() || !found->second || ctx.buffer_mappings.count(name)) {
++		gl4metalSetError(GL_INVALID_OPERATION); return;
++	}
++	const NSUInteger length = glBufferLogicalSize(name);
++	if (offset < 0 || size < 0 || (NSUInteger)offset > length || (NSUInteger)size > length - (NSUInteger)offset) {
++		gl4metalSetError(GL_INVALID_VALUE); return;
++	}
++	if (!imageFormatClass(internalformat)) { gl4metalSetError(GL_INVALID_ENUM); return; }
++	uint8_t texel[16] = {};
++	size_t bytes = 0;
++	if (!gl4metalEncodeClearValue(internalformat, format, type, data, texel, bytes) || !bytes) {
++		gl4metalSetError(GL_INVALID_OPERATION); return;
++	}
++	if ((NSUInteger)offset % bytes || (NSUInteger)size % bytes) { gl4metalSetError(GL_INVALID_VALUE); return; }
++	if (!size) return;
++	id<MTLBuffer> buffer = found->second;
++	if (!makeBufferWritableWithoutStall(name, buffer, offset != 0 || (NSUInteger)size != length)) return;
++	uint8_t *destination = (uint8_t *)buffer.contents + offset;
++	for (NSUInteger i = 0; i < (NSUInteger)size; i += bytes) memcpy(destination + i, texel, bytes);
++	invalidateConvertedVertexBuffers(name);
++}
++
++void glClearBufferData(GLenum target, GLenum internalformat, GLenum format, GLenum type, const void *data) {
++	if (!isBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
++	glClearBufferSubData(target, internalformat, 0, (GLsizeiptr)glBufferLogicalSize(boundBuffer(target)), format, type, data);
++}
++
+ // MARK: - Buffer queries
+ 
+-void glGetBufferParameteriv(GLenum target, GLenum pname, GLint *params) {
+-	if (!isBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); if (params) *params = 0; return; }
++void glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64 *params) {
++	if (!isBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+ 	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+-	GLuint buf_id = boundBuffer(target);
+-	auto it = ctx.buffer_objects.find(buf_id);
+-	if (buf_id == 0 || it == ctx.buffer_objects.end() || !it->second) {
+-		*params = 0;
+-		return;
+-	}
+-	id<MTLBuffer> buffer = it->second;
++	const GLuint name = boundBuffer(target);
++	auto found = ctx.buffer_objects.find(name);
++	if (!name || found == ctx.buffer_objects.end()) { gl4metalSetError(GL_INVALID_OPERATION); return; }
++	auto mapping = ctx.buffer_mappings.find(name);
++	const BufferMapping map = mapping == ctx.buffer_mappings.end() ? BufferMapping() : mapping->second;
+ 	switch (pname) {
+-		case GL_BUFFER_SIZE:       *params = (GLint)glBufferLogicalSize(buf_id); break;
+-		case GL_BUFFER_USAGE:      *params = GL_STATIC_DRAW;       break;
+-		case GL_BUFFER_MAPPED:     *params = GL_FALSE;             break;
+-		case GL_BUFFER_ACCESS:     *params = GL_READ_WRITE;        break;
+-		case GL_BUFFER_MAP_OFFSET: *params = 0;                    break;
+-		case GL_BUFFER_MAP_LENGTH: *params = (GLint)glBufferLogicalSize(buf_id); break;
+-		default:
+-			gl4metalSetError(GL_INVALID_ENUM);
+-			GL4METAL_LOG("glGetBufferParameteriv: unhandled pname 0x%X", pname);
+-			*params = 0;
+-			break;
++		case GL_BUFFER_SIZE: *params = (GLint64)glBufferLogicalSize(name); break;
++		case GL_BUFFER_USAGE: *params = ctx.buffer_usages.count(name) ? ctx.buffer_usages[name] : GL_STATIC_DRAW; break;
++		case GL_BUFFER_MAPPED: *params = mapping == ctx.buffer_mappings.end() ? GL_FALSE : GL_TRUE; break;
++		case GL_BUFFER_ACCESS_FLAGS: *params = map.access; break;
++		case GL_BUFFER_ACCESS: *params = !map.access || (map.access & (GL_MAP_READ_BIT | GL_MAP_WRITE_BIT)) == (GL_MAP_READ_BIT | GL_MAP_WRITE_BIT)
++			? GL_READ_WRITE : map.access & GL_MAP_READ_BIT ? GL_READ_ONLY : GL_WRITE_ONLY; break;
++		case GL_BUFFER_MAP_OFFSET: *params = map.offset; break;
++		case GL_BUFFER_MAP_LENGTH: *params = map.length; break;
++		default: gl4metalSetError(GL_INVALID_ENUM); break;
+ 	}
+ }
+ 
+-void glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64 *params) {
++void glGetBufferParameteriv(GLenum target, GLenum pname, GLint *params) {
+ 	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+-	GLint v = 0;
+-	glGetBufferParameteriv(target, pname, &v);
+-	*params = v;
++	GLint64 value = 0;
++	glGetBufferParameteri64v(target, pname, &value);
++	*params = (GLint)value;
+ }
+ 
+ void glGetBufferPointerv(GLenum target, GLenum pname, void **params) {
+ 	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+-	if (!isBufferTarget(target) || pname != GL_BUFFER_MAP_POINTER) { gl4metalSetError(GL_INVALID_ENUM); *params = NULL; return; }
+-	*params = NULL; // mappings are not tracked: glMapBuffer hands out the CPU pointer of the shared buffer
++	if (!isBufferTarget(target) || pname != GL_BUFFER_MAP_POINTER) { gl4metalSetError(GL_INVALID_ENUM); return; }
++	const GLuint name = boundBuffer(target);
++	auto found = ctx.buffer_objects.find(name);
++	if (!name || found == ctx.buffer_objects.end()) { gl4metalSetError(GL_INVALID_OPERATION); return; }
++	auto mapping = ctx.buffer_mappings.find(name);
++	*params = mapping == ctx.buffer_mappings.end() ? nullptr : (uint8_t *)found->second.contents + mapping->second.offset;
+ }
+diff --git a/gl4metal/draw.mm b/gl4metal/draw.mm
+index e407b802c5ebc79f6de0baad9e40b32cda545c0d..bba94fed718939cc477727478223e14b698d9d3f 100644
+--- a/gl4metal/draw.mm
++++ b/gl4metal/draw.mm
+@@ -1,4 +1,5 @@
+ #import "draw.h"
++#import "texture.h"
+ 
+ #include <mutex>
+ #include <atomic>
+@@ -1668,6 +1669,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
+ 		for (const TranslatedStorageBuffer &storageInfo : p.storage_buffers) {
+ 			if (storageInfo.stage[0].present || storageInfo.stage[1].present) {
+ 				appendUnique(ctx.shader_storage_buffer_bindings[storageInfo.binding].buffer);
++				invalidateConvertedVertexBuffers(ctx.shader_storage_buffer_bindings[storageInfo.binding].buffer);
+ 			}
+ 		}
+ 		appendUnique(elementBuffer);
+@@ -1726,7 +1728,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
+ 		}
+ 		const ShaderStorageBufferBinding &binding = ctx.shader_storage_buffer_bindings[storageInfo.binding];
+ 		auto bound = ctx.buffer_objects.find(binding.buffer);
+-		if (binding.buffer == 0 || bound == ctx.buffer_objects.end() || !bound->second) {
++		if (binding.buffer == 0 || bound == ctx.buffer_objects.end() || !bound->second || ctx.buffer_mappings.count(binding.buffer)) {
+ 			gl4metalSetError(GL_INVALID_OPERATION);
+ 			GL4METAL_LOG("%s: active shader storage block '%s' has no buffer at binding point %u; draw skipped",
+ 				caller, storageInfo.name.c_str(), storageInfo.binding);
+@@ -1871,6 +1873,17 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
+ 		}
+ 	}
+ 
++	for (size_t imageIndex = 0; imageIndex < p.storage_images.size(); ++imageIndex) {
++		for (int stage = 0; stage < 2; ++stage) {
++			const auto &info = p.storage_images[imageIndex].stage[stage];
++			if (!info.present) continue;
++			id<MTLTexture> texture = resolveImageTexture(p, imageIndex, stage);
++			if (!texture) return;
++			if (stage == 0) bindVertexTextureCached(encoderCache, enc, texture, info.slot);
++			else bindFragmentTextureCached(encoderCache, enc, texture, info.slot);
++		}
++	}
++
+ 	// Textures: direct Metal bindings are the fastest compatible path here. The
+ 	// GL combined unit index selects the source texture; the MSL slot stays dense
+ 	// and stage-local (0...15), independent of the GL unit number.
+diff --git a/gl4metal/exports.h b/gl4metal/exports.h
+index 6586d2549391b142b882dc3aba7908b22e550075..91e8fef39fddf769c8879cc51bec60b523a86046 100644
+--- a/gl4metal/exports.h
++++ b/gl4metal/exports.h
+@@ -46,6 +46,11 @@ GL4METAL_EXPORT void glInvalidateFramebuffer(GLenum target, GLsizei numAttachmen
+ GL4METAL_EXPORT void glInvalidateSubFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments, GLint x, GLint y, GLsizei width, GLsizei height);
+ GL4METAL_EXPORT void glMemoryBarrier(GLbitfield barriers);
+ GL4METAL_EXPORT void glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer, GLenum access, GLenum format);
++GL4METAL_EXPORT void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height);
++GL4METAL_EXPORT void glTexStorage3D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth);
++GL4METAL_EXPORT void glClearBufferData(GLenum target, GLenum internalformat, GLenum format, GLenum type, const void *data);
++GL4METAL_EXPORT void glClearBufferSubData(GLenum target, GLenum internalformat, GLintptr offset, GLsizeiptr size,
++	GLenum format, GLenum type, const void *data);
+ GL4METAL_EXPORT void glDrawArrays(GLenum mode, GLint first, GLsizei count);
+ GL4METAL_EXPORT void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices);
+ GL4METAL_EXPORT void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices);
+diff --git a/gl4metal/exports.mm b/gl4metal/exports.mm
+index cbf0cf64603f8e2797178c8efd534f724e47a799..540c8c9f58ab185ae5897616048c6e137084ab26 100644
+--- a/gl4metal/exports.mm
++++ b/gl4metal/exports.mm
+@@ -36,6 +36,10 @@ void gl4metalCheckExports(void) {
+ 		"glInvalidateSubFramebuffer",
+ 		"glMemoryBarrier",
+ 		"glBindImageTexture",
++		"glTexStorage2D",
++		"glTexStorage3D",
++		"glClearBufferData",
++		"glClearBufferSubData",
+ 		"glFinish",
+ 		"glDrawArrays",
+ 		"glDrawElements",
+diff --git a/gl4metal/extensions/ARB/GL_ARB_compute_shader.mm b/gl4metal/extensions/ARB/GL_ARB_compute_shader.mm
+index 6025ebc5c49b51e4f5b50bd98e3e14c099c4033c..fd587d6f599be6fa34699fceb88617e6d6bfa7a8 100644
+--- a/gl4metal/extensions/ARB/GL_ARB_compute_shader.mm
++++ b/gl4metal/extensions/ARB/GL_ARB_compute_shader.mm
+@@ -19,7 +19,7 @@ void glDispatchComputeIndirect(GLintptr indirect) {
+ 		return;
+ 	}
+ 	auto bufferIt = ctx.buffer_objects.find(indirectBufferName);
+-	if (bufferIt == ctx.buffer_objects.end() || !bufferIt->second) {
++	if (bufferIt == ctx.buffer_objects.end() || !bufferIt->second || ctx.buffer_mappings.count(indirectBufferName)) {
+ 		gl4metalSetError(GL_INVALID_OPERATION);
+ 		return;
+ 	}
+diff --git a/gl4metal/extensions/ARB/GL_ARB_shader_image_load_store.mm b/gl4metal/extensions/ARB/GL_ARB_shader_image_load_store.mm
+index e9fe56999f25efdc59cb06cbab771f89815c2346..1a2c8772225fff6f4afb491479e6f07b77ac5b2a 100644
+--- a/gl4metal/extensions/ARB/GL_ARB_shader_image_load_store.mm
++++ b/gl4metal/extensions/ARB/GL_ARB_shader_image_load_store.mm
+@@ -1,4 +1,6 @@
+ #import "gl4metal.h"
++#import "texture.h"
++#include "imageformats.h"
+ 
+ void glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer,
+ 	GLenum access, GLenum format) {
+@@ -10,53 +12,73 @@ void glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean laye
+ 		gl4metalSetError(GL_INVALID_ENUM);
+ 		return;
+ 	}
+-	if (texture == 0) {
+-		ctx.image_unit_bindings[unit] = ImageUnitBinding();
+-		return;
+-	}
+-	if (level != 0) {
++	if (level < 0 || layer < 0) {
+ 		gl4metalSetError(GL_INVALID_VALUE);
+-		GL4METAL_LOG("glBindImageTexture: only mip level 0 is currently supported");
+ 		return;
+ 	}
++	if (!imageFormatClass(format)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+ 	auto textureFound = ctx.texture_objects.find(texture);
+-	if (textureFound == ctx.texture_objects.end() || !textureFound->second.texture ||
+-		textureFound->second.width <= 0 || textureFound->second.height <= 0) {
+-		gl4metalSetError(GL_INVALID_OPERATION);
+-		GL4METAL_LOG("glBindImageTexture: texture %u is not allocated", texture);
+-		return;
+-	}
+-	const GLenum textureTarget = textureFound->second.target;
+-	// Per OpenGL, the layered parameter has no effect for a non-layered
+-	// GL_TEXTURE_2D object. A caller may therefore pass GL_TRUE here; requiring
+-	// GL_FALSE incorrectly drops the image binding and makes every later compute
+-	// dispatch fail even though the bound resource is a valid 2D texture.
+-	const bool is2D = textureTarget == GL_TEXTURE_2D && layer == 0 &&
+-		textureFound->second.texture.textureType == MTLTextureType2D;
+-	const bool is3D = textureTarget == GL_TEXTURE_3D && layered == GL_TRUE &&
+-		textureFound->second.depth > 0 && textureFound->second.texture.textureType == MTLTextureType3D;
+-	if (!is2D && !is3D) {
++	if (texture != 0 && textureFound == ctx.texture_objects.end()) {
+ 		gl4metalSetError(GL_INVALID_OPERATION);
+-		GL4METAL_LOG("glBindImageTexture: supported bindings are GL_TEXTURE_2D (layered flag ignored, layer 0) and layered GL_TEXTURE_3D (texture=%u target=0x%X layered=%u layer=%d)",
+-			texture, textureTarget, (unsigned)layered, layer);
+-		return;
+-	}
+-	if (format != textureFound->second.internalformat) {
+-		gl4metalSetError(GL_INVALID_VALUE);
+-		GL4METAL_LOG("glBindImageTexture: image format 0x%X does not match texture %u internal format 0x%X",
+-			format, texture, textureFound->second.internalformat);
+ 		return;
+ 	}
+ 	ImageUnitBinding binding;
+ 	binding.texture = texture;
+ 	binding.level = level;
+-	binding.layered = layered;
++	binding.layered = layered ? GL_TRUE : GL_FALSE;
+ 	binding.layer = layer;
+ 	binding.access = access;
+ 	binding.format = format;
+ 	ctx.image_unit_bindings[unit] = binding;
+ }
+ 
++// Image storage may be allocated/replaced after glBindImageTexture. Resolve the
++// current allocation at draw/dispatch time; never retain a stale texture view.
++id<MTLTexture> resolveImageTexture(const ProgramObject &program, size_t imageIndex, int stage) {
++	const auto &image = program.storage_images[imageIndex];
++	const auto &info = image.stage[stage];
++	const GLint unit = imageIndex < program.image_units.size() ? program.image_units[imageIndex] : -1;
++	if (unit < 0 || unit >= GL4METAL_MAX_IMAGE_UNITS || info.slot >= 32) {
++		gl4metalSetError(GL_INVALID_OPERATION); return nil;
++	}
++	auto &binding = ctx.image_unit_bindings[unit];
++	auto found = ctx.texture_objects.find(binding.texture);
++	if (!binding.texture || found == ctx.texture_objects.end()) {
++		gl4metalSetError(GL_INVALID_OPERATION); return nil;
++	}
++	const auto &object = found->second;
++	id<MTLTexture> source = object.texture;
++	const MTLTextureType expectedType = image.is_3d ? MTLTextureType3D : MTLTextureType2D;
++	const unsigned formatClass = imageFormatClass(binding.format);
++	const GLenum shaderComponent = image.gl_type == GL_INT_IMAGE_2D || image.gl_type == GL_INT_IMAGE_3D ? GL_INT :
++		image.gl_type == GL_UNSIGNED_INT_IMAGE_2D || image.gl_type == GL_UNSIGNED_INT_IMAGE_3D ? GL_UNSIGNED_INT : GL_FLOAT;
++	if (!source || source.textureType != expectedType || binding.level < 0 ||
++		(NSUInteger)binding.level >= source.mipmapLevelCount || (image.is_3d && !binding.layered) ||
++		!formatClass || formatClass != imageFormatClass(object.internalformat) ||
++		shaderComponent != imageComponentType(binding.format) ||
++		(image.format && image.format != binding.format)) {
++		gl4metalSetError(GL_INVALID_OPERATION);
++		GL4METAL_LOG("image '%s': incompatible texture, mip, layer mode or format", image.name.c_str());
++		return nil;
++	}
++	const bool reads = !info.write_only, writes = !info.read_only;
++	if ((reads && (binding.access == GL_WRITE_ONLY || !(source.usage & MTLTextureUsageShaderRead))) ||
++		(writes && (binding.access == GL_READ_ONLY || !(source.usage & MTLTextureUsageShaderWrite)))) {
++		gl4metalSetError(GL_INVALID_OPERATION); return nil;
++	}
++	if (binding.view_source != source || !binding.view) {
++		const MTLPixelFormat pixelFormat = metalPixelFormat(binding.format);
++		binding.view = [source newTextureViewWithPixelFormat:pixelFormat textureType:expectedType
++			levels:NSMakeRange((NSUInteger)binding.level, 1) slices:NSMakeRange(0, 1)];
++		binding.view_source = source;
++		if (!binding.view) {
++			gl4metalSetError(GL_INVALID_OPERATION);
++			GL4METAL_LOG("image '%s': Metal cannot create the requested image view", image.name.c_str());
++		}
++	}
++	return binding.view;
++}
++
+ void glMemoryBarrier(GLbitfield barriers) {
+ 	constexpr GLbitfield validBarrierBits =
+ 		GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT | GL_ELEMENT_ARRAY_BARRIER_BIT |
+diff --git a/gl4metal/getter.mm b/gl4metal/getter.mm
+index 15f47cc058cb1d34dcd944939d069e9a35a26cb3..6ac33c9cde4510bfe9fd550a21f76808375f1f04 100644
+--- a/gl4metal/getter.mm
++++ b/gl4metal/getter.mm
+@@ -212,24 +212,25 @@ void glGetIntegerv(GLenum pname, GLint *data) {
+ 			*data = 4096;
+ 			break;
+ 		case GL_MAX_IMAGE_UNITS:
+-			*data = gl4metalSupportsComputeShaders() ? GL4METAL_MAX_IMAGE_UNITS : 0;
++			*data = GL4METAL_MAX_IMAGE_UNITS;
+ 			break;
+ 		case GL_MAX_VERTEX_IMAGE_UNIFORMS:
++		case GL_MAX_FRAGMENT_IMAGE_UNIFORMS:
++			*data = GL4METAL_MAX_IMAGE_UNITS;
++			break;
+ 		case GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS:
+ 		case GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS:
+ 		case GL_MAX_GEOMETRY_IMAGE_UNIFORMS:
+-		case GL_MAX_FRAGMENT_IMAGE_UNIFORMS:
+-			*data = 0; // image load/store is currently implemented for compute only
++			*data = 0;
+ 			break;
+ 		case GL_MAX_COMBINED_IMAGE_UNIFORMS:
+-			*data = gl4metalSupportsComputeShaders() ? GL4METAL_MAX_IMAGE_UNITS : 0;
++			*data = 2 * GL4METAL_MAX_IMAGE_UNITS;
+ 			break;
+ 		case GL_MAX_IMAGE_SAMPLES:
+ 			*data = 0; // multisample storage images are not implemented
+ 			break;
+ 		case GL_MAX_COMBINED_IMAGE_UNITS_AND_FRAGMENT_OUTPUTS:
+-			*data = std::max(41 + (GLint)GL4METAL_MAX_COLOR_ATTACHMENTS,
+-				(gl4metalSupportsComputeShaders() ? 16 + (GLint)GL4METAL_MAX_IMAGE_UNITS : 0));
++			*data = 41 + 2 * GL4METAL_MAX_IMAGE_UNITS + GL4METAL_MAX_COLOR_ATTACHMENTS;
+ 			break;
+ 		case GL_MAX_COMPUTE_SHARED_MEMORY_SIZE:
+ 			*data = gl4metalSupportsComputeShaders()
+diff --git a/gl4metal/gl4metal.h b/gl4metal/gl4metal.h
+index 8d1c144f9fc80fdbdfbd329b3f2c1aee78181a7d..3d107313ca9acf3b1e14a0c6571d6c98a7c5e623 100644
+--- a/gl4metal/gl4metal.h
++++ b/gl4metal/gl4metal.h
+@@ -227,6 +227,8 @@ struct TextureObject {
+ 	id<MTLTexture> texture = nil;
+ 	GLenum internalformat = 0; // 0 until level 0 or a buffer texture format is defined
+ 	GLsizei width = 0, height = 0, depth = 1; // level 0 size; depth > 1 for GL_TEXTURE_3D
++	bool immutable = false;
++	GLsizei immutable_levels = 0;
+ 	GLuint buffer_object = 0; // GL_TEXTURE_BUFFER backing store name (0 for ordinary textures)
+ 	GLenum buffer_sampler_type = 0; // GL_SAMPLER_BUFFER / GL_INT_SAMPLER_BUFFER / GL_UNSIGNED_INT_SAMPLER_BUFFER
+ 
+@@ -423,6 +425,15 @@ struct ImageUnitBinding {
+ 	GLint layer = 0;
+ 	GLenum access = GL_READ_ONLY;
+ 	GLenum format = GL_RGBA8;
++	// Cached view is invalidated by comparing its source allocation at use time.
++	id<MTLTexture> view_source = nil;
++	id<MTLTexture> view = nil;
++};
++
++struct BufferMapping {
++	GLintptr offset = 0;
++	GLsizeiptr length = 0;
++	GLbitfield access = 0;
+ };
+ 
+ struct MTLContext {
+@@ -447,6 +458,8 @@ struct MTLContext {
+ 	
+ 	std::unordered_map<GLenum, GLuint> bound_buffers;
+ 	std::unordered_map<GLuint, id<MTLBuffer>> buffer_objects;
++	std::unordered_map<GLuint, BufferMapping> buffer_mappings;
++	std::unordered_map<GLuint, GLenum> buffer_usages;
+ 	std::unordered_map<GLuint, VertexArray> vao_objects;
+ 	std::unordered_map<GLuint, TextureObject> texture_objects;
+ 	std::unordered_map<GLuint, FBO> fbo_objects;
+diff --git a/gl4metal/imageformats.h b/gl4metal/imageformats.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..713c676a008bdbffd1db2b2a636228c41f37685a
+--- /dev/null
++++ b/gl4metal/imageformats.h
+@@ -0,0 +1,73 @@
++#pragma once
++#include <GL/glcorearb.h>
++#include <cstdint>
++#include <cstring>
++#include <algorithm>
++#include <limits>
++
++// Exact integer transfer helpers: routing uint32 texels through float loses bits.
++inline unsigned integerScalarBytes(GLenum type) {
++	switch (type) {
++		case GL_BYTE: case GL_UNSIGNED_BYTE: return 1;
++		case GL_SHORT: case GL_UNSIGNED_SHORT: return 2;
++		case GL_INT: case GL_UNSIGNED_INT: return 4;
++		default: return 0;
++	}
++}
++
++inline int64_t readIntegerComponent(const uint8_t *p, GLenum type, bool swap = false) {
++	const unsigned n = integerScalarBytes(type);
++	uint32_t bits = 0;
++	for (unsigned i = 0; i < n; ++i) bits |= uint32_t(p[swap ? n - 1 - i : i]) << (8 * i);
++	switch (type) {
++		case GL_BYTE: return int8_t(bits);
++		case GL_SHORT: return int16_t(bits);
++		case GL_INT: return int32_t(bits);
++		default: return bits;
++	}
++}
++
++inline void writeIntegerComponent(uint8_t *p, unsigned bytes, bool isSigned, int64_t value, bool swap = false) {
++	const unsigned bits = bytes * 8;
++	const int64_t low = isSigned ? -(int64_t(1) << (bits - 1)) : 0;
++	const int64_t high = (int64_t(1) << (isSigned ? bits - 1 : bits)) - 1;
++	const uint32_t v = uint32_t(std::max(low, std::min(high, value)));
++	for (unsigned i = 0; i < bytes; ++i) p[swap ? bytes - 1 - i : i] = uint8_t(v >> (8 * i));
++}
++
++inline bool integerExternalFormat(GLenum format) {
++	return format == GL_RED_INTEGER || format == GL_RG_INTEGER || format == GL_RGB_INTEGER ||
++		format == GL_RGBA_INTEGER || format == GL_BGR_INTEGER || format == GL_BGRA_INTEGER;
++}
++
++inline GLenum imageComponentType(GLenum format) {
++	switch (format) {
++		case GL_R8I: case GL_RG8I: case GL_RGBA8I:
++		case GL_R16I: case GL_RG16I: case GL_RGBA16I:
++		case GL_R32I: case GL_RG32I: case GL_RGBA32I: return GL_INT;
++		case GL_R8UI: case GL_RG8UI: case GL_RGBA8UI:
++		case GL_R16UI: case GL_RG16UI: case GL_RGBA16UI:
++		case GL_R32UI: case GL_RG32UI: case GL_RGBA32UI:
++		case GL_RGB10_A2UI: return GL_UNSIGNED_INT;
++		default: return GL_FLOAT;
++	}
++}
++
++// Image compatibility classes (component count and width). Packed formats have
++// distinct classes. Zero means the format cannot be bound for image load/store.
++inline unsigned imageFormatClass(GLenum format) {
++	switch (format) {
++		case GL_R8: case GL_R8_SNORM: case GL_R8I: case GL_R8UI: return 0x108;
++		case GL_R16: case GL_R16_SNORM: case GL_R16F: case GL_R16I: case GL_R16UI: return 0x110;
++		case GL_R32F: case GL_R32I: case GL_R32UI: return 0x120;
++		case GL_RG8: case GL_RG8_SNORM: case GL_RG8I: case GL_RG8UI: return 0x208;
++		case GL_RG16: case GL_RG16_SNORM: case GL_RG16F: case GL_RG16I: case GL_RG16UI: return 0x210;
++		case GL_RG32F: case GL_RG32I: case GL_RG32UI: return 0x220;
++		case GL_RGBA8: case GL_RGBA8_SNORM: case GL_RGBA8I: case GL_RGBA8UI: return 0x408;
++		case GL_RGBA16: case GL_RGBA16_SNORM: case GL_RGBA16F: case GL_RGBA16I: case GL_RGBA16UI: return 0x410;
++		case GL_RGBA32F: case GL_RGBA32I: case GL_RGBA32UI: return 0x420;
++		case GL_RGB10_A2: case GL_RGB10_A2UI: return 0x1000;
++		case GL_R11F_G11F_B10F: return 0x1001;
++		default: return 0;
++	}
++}
+diff --git a/gl4metal/program.mm b/gl4metal/program.mm
+index cd550faf1d6c04b06248449fa29f957d47164d44..28af21cadd78990e990507811d3635fd73f682d4 100644
+--- a/gl4metal/program.mm
++++ b/gl4metal/program.mm
+@@ -2,6 +2,7 @@
+ #import "shaders.h"
+ #import "draw.h"
+ #import "sync.h"
++#import "texture.h"
+ 
+ #include <mutex>
+ #include <atomic>
+@@ -10,6 +11,20 @@
+ #include <cstdlib>
+ #include <sstream>
+ 
++static bool nativeTextureAtomics() {
++	if (@available(iOS 17.0, *)) return [ctx.device supportsFamily:MTLGPUFamilyApple6];
++	return false;
++}
++
++static uint32_t shaderMSLVersion() { return nativeTextureAtomics() ? 30100u : 20200u; }
++
++static MTLLanguageVersion shaderMetalLanguage() {
++	if (@available(iOS 17.0, *)) {
++		if (nativeTextureAtomics()) return MTLLanguageVersion3_1;
++	}
++	return MTLLanguageVersion2_2;
++}
++
+ // MARK: - Helpers
+ 
+ static ProgramObject *findProgram(GLuint program) {
+@@ -87,7 +102,7 @@ static id<MTLComputePipelineState> computePipelineForMSL(const std::string &mslS
+ 
+ 	ComputePipelineCacheEntry compiled;
+ 	MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+-	options.languageVersion = MTLLanguageVersion2_2;
++	options.languageVersion = shaderMetalLanguage();
+ 	NSError *libraryError = nil;
+ 	NSString *source = [NSString stringWithUTF8String:mslSource.c_str()];
+ 	id<MTLLibrary> library = source ? [ctx.device newLibraryWithSource:source options:options error:&libraryError] : nil;
+@@ -150,7 +165,7 @@ static bool vertexStageFunctionsForMSL(const std::string &mslSource, VertexStage
+ 	VertexStageCacheEntry compiled;
+ 	NSString *source = [NSString stringWithUTF8String:mslSource.c_str()];
+ 	MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+-	options.languageVersion = MTLLanguageVersion2_2;
++	options.languageVersion = shaderMetalLanguage();
+ 	NSError *libraryError = nil;
+ 	id<MTLLibrary> library = source ? [ctx.device newLibraryWithSource:source options:options error:&libraryError] : nil;
+ 	if (!library) {
+@@ -224,7 +239,7 @@ static bool fragmentStageFunctionForMSL(const std::string &mslSource, FragmentSt
+ 	FragmentStageCacheEntry compiled;
+ 	NSString *source = [NSString stringWithUTF8String:mslSource.c_str()];
+ 	MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+-	options.languageVersion = MTLLanguageVersion2_2;
++	options.languageVersion = shaderMetalLanguage();
+ 	NSError *libraryError = nil;
+ 	id<MTLLibrary> library = source ? [ctx.device newLibraryWithSource:source options:options error:&libraryError] : nil;
+ 	compiled.function = [library newFunctionWithName:@"main0"];
+@@ -294,12 +309,67 @@ static GLenum activeUniformGLType(const TranslatedUniform &u) {
+ }
+ 
+ static std::string activeUniformName(const TranslatedUniform &u) {
+-	return u.array_size > 1 ? u.name + "[0]" : u.name;
++	return u.is_array || u.array_size > 1 ? u.name + "[0]" : u.name;
++}
++
++static void appendImageUniforms(ProgramObject &program, GLint &nextLocation) {
++	program.image_units.clear();
++	for (const auto &image : program.storage_images) program.image_units.push_back((GLint)image.binding);
++	// Storage images are opaque OpenGL uniforms too. They were previously kept only in
++	// storage_images for MSL binding, so Iris could not discover them through
++	// GL_ACTIVE_UNIFORMS / glGetUniformLocation and consequently never called
++	// glBindImageTexture. Build one location-bearing ProgramUniform per image resource;
++	// flattened array elements share one uniform and consecutive locations.
++	for (size_t imageIndex = 0; imageIndex < program.storage_images.size();) {
++		const TranslatedImage &firstImage = program.storage_images[imageIndex];
++		std::string imageBaseName = firstImage.name;
++		uint32_t arrayCount = 1;
++		const size_t bracket = imageBaseName.rfind('[');
++		if (bracket != std::string::npos && !imageBaseName.empty() && imageBaseName.back() == ']') {
++			const std::string indexText = imageBaseName.substr(bracket + 1, imageBaseName.size() - bracket - 2);
++			char *endPtr = nullptr;
++			const unsigned long parsedIndex = std::strtoul(indexText.c_str(), &endPtr, 10);
++			if (endPtr && *endPtr == '\0' && parsedIndex == 0) {
++				const std::string candidateBase = imageBaseName.substr(0, bracket);
++				uint32_t candidateCount = 0;
++				while (imageIndex + candidateCount < program.storage_images.size()) {
++					const std::string expectedName = candidateBase + "[" + std::to_string(candidateCount) + "]";
++					if (program.storage_images[imageIndex + candidateCount].name != expectedName) break;
++					++candidateCount;
++				}
++				if (candidateCount != 0) {
++					imageBaseName = candidateBase;
++					arrayCount = candidateCount;
++				}
++			}
++		}
++
++		ProgramUniform imageUniform;
++		imageUniform.info.name = imageBaseName;
++		imageUniform.info.kind = TranslatedUniform::Int; // GL image-unit values are set/read as GLint
++		imageUniform.info.vecsize = 1;
++		imageUniform.info.columns = 1;
++		imageUniform.info.array_size = (int)arrayCount;
++		imageUniform.info.is_array = imageBaseName != firstImage.name;
++		for (int stage = 0; stage < 3; ++stage)
++			imageUniform.info.stage[stage].present = firstImage.stage[stage].present;
++		imageUniform.base_location = nextLocation;
++		imageUniform.is_image = true;
++		imageUniform.opaque_gl_type = firstImage.gl_type;
++		imageUniform.image_index = (uint32_t)imageIndex;
++		for (uint32_t element = 0; element < arrayCount; ++element) {
++			program.locations.emplace_back((GLint)program.uniforms.size(), (GLint)element);
++		}
++		nextLocation += (GLint)arrayCount;
++		program.uniforms.push_back(std::move(imageUniform));
++		imageIndex += arrayCount;
++	}
++
+ }
+ 
+ static bool linkComputeProgram(GLuint programName, ProgramObject &program, const ShaderObject &computeShader) {
+ 	TranslatedProgram translated;
+-	if (!translateComputeProgram(computeShader.source, translated)) {
++	if (!translateComputeProgram(computeShader.source, translated, shaderMSLVersion())) {
+ 		program.info_log = translated.log;
+ 		GL4METAL_LOG("glLinkProgram(%u): compute translation failed:\n%s", programName, translated.log.c_str());
+ 		return false;
+@@ -357,6 +427,16 @@ static bool linkComputeProgram(GLuint programName, ProgramObject &program, const
+ 		return false;
+ 	}
+ 
++	const MTLSize axisLimit = ctx.device.maxThreadsPerThreadgroup;
++	const uint64_t invocations = uint64_t(translated.workgroup_size[0]) * translated.workgroup_size[1] * translated.workgroup_size[2];
++	if (!invocations || invocations > gl4metalMaxComputeWorkGroupInvocations() ||
++		invocations > computePipeline.maxTotalThreadsPerThreadgroup ||
++		translated.workgroup_size[0] > axisLimit.width || translated.workgroup_size[1] > axisLimit.height ||
++		translated.workgroup_size[2] > axisLimit.depth) {
++		program.info_log = "compute local workgroup size exceeds the device/pipeline limits\n";
++		return false;
++	}
++
+ 	program.compute_pipeline = computePipeline;
+ 	program.compute_workgroup_size[0] = translated.workgroup_size[0];
+ 	program.compute_workgroup_size[1] = translated.workgroup_size[1];
+@@ -365,11 +445,6 @@ static bool linkComputeProgram(GLuint programName, ProgramObject &program, const
+ 	program.storage_images = translated.storage_images;
+ 	for (int stage = 0; stage < 3; ++stage)
+ 		program.needs_buffer_size_buffer[stage] = translated.needs_buffer_size_buffer[stage];
+-	program.image_units.clear();
+-	program.image_units.reserve(program.storage_images.size());
+-	for (const TranslatedImage &imageInfo : program.storage_images) {
+-		program.image_units.push_back((GLint)imageInfo.binding);
+-	}
+ 	program.uniforms.reserve(translated.uniforms.size() + translated.storage_images.size());
+ 	GLint nextLocation = 0;
+ 	for (const TranslatedUniform &uniformInfo : translated.uniforms) {
+@@ -384,52 +459,7 @@ static bool linkComputeProgram(GLuint programName, ProgramObject &program, const
+ 		program.uniforms.push_back(std::move(uniform));
+ 	}
+ 
+-	// Storage images are opaque OpenGL uniforms too. They were previously kept only in
+-	// storage_images for MSL binding, so Iris could not discover them through
+-	// GL_ACTIVE_UNIFORMS / glGetUniformLocation and consequently never called
+-	// glBindImageTexture. Build one location-bearing ProgramUniform per image resource;
+-	// flattened array elements share one uniform and consecutive locations.
+-	for (size_t imageIndex = 0; imageIndex < program.storage_images.size();) {
+-		const TranslatedImage &firstImage = program.storage_images[imageIndex];
+-		std::string imageBaseName = firstImage.name;
+-		uint32_t arrayCount = 1;
+-		const size_t bracket = imageBaseName.rfind('[');
+-		if (bracket != std::string::npos && !imageBaseName.empty() && imageBaseName.back() == ']') {
+-			const std::string indexText = imageBaseName.substr(bracket + 1, imageBaseName.size() - bracket - 2);
+-			char *endPtr = nullptr;
+-			const unsigned long parsedIndex = std::strtoul(indexText.c_str(), &endPtr, 10);
+-			if (endPtr && *endPtr == '\0' && parsedIndex == 0) {
+-				const std::string candidateBase = imageBaseName.substr(0, bracket);
+-				uint32_t candidateCount = 0;
+-				while (imageIndex + candidateCount < program.storage_images.size()) {
+-					const std::string expectedName = candidateBase + "[" + std::to_string(candidateCount) + "]";
+-					if (program.storage_images[imageIndex + candidateCount].name != expectedName) break;
+-					++candidateCount;
+-				}
+-				if (candidateCount != 0) {
+-					imageBaseName = candidateBase;
+-					arrayCount = candidateCount;
+-				}
+-			}
+-		}
+-
+-		ProgramUniform imageUniform;
+-		imageUniform.info.name = imageBaseName;
+-		imageUniform.info.kind = TranslatedUniform::Int; // GL image-unit values are set/read as GLint
+-		imageUniform.info.vecsize = 1;
+-		imageUniform.info.columns = 1;
+-		imageUniform.info.array_size = (int)arrayCount;
+-		imageUniform.base_location = nextLocation;
+-		imageUniform.is_image = true;
+-		imageUniform.opaque_gl_type = firstImage.is_3d ? 0x904Eu : 0x904Du; // GL_IMAGE_3D / GL_IMAGE_2D
+-		imageUniform.image_index = (uint32_t)imageIndex;
+-		for (uint32_t element = 0; element < arrayCount; ++element) {
+-			program.locations.emplace_back((GLint)program.uniforms.size(), (GLint)element);
+-		}
+-		nextLocation += (GLint)arrayCount;
+-		program.uniforms.push_back(std::move(imageUniform));
+-		imageIndex += arrayCount;
+-	}
++	appendImageUniforms(program, nextLocation);
+ 
+ 	program.uniform_data[2].assign(translated.block_size[2], 0);
+ 	for (const TranslatedBlock &blockInfo : translated.blocks) {
+@@ -500,7 +530,8 @@ static bool resolveComputeBuffer(GLuint buffer_id, GLintptr offset, GLsizeiptr b
+ 	uint32_t requiredSize, bool runtimeSized, __strong id<MTLBuffer> &metalBuffer,
+ 	NSUInteger &metalOffset, NSUInteger &availableSize) {
+ 	auto bufferFound = ctx.buffer_objects.find(buffer_id);
+-	if (buffer_id == 0 || bufferFound == ctx.buffer_objects.end() || !bufferFound->second || offset < 0) {
++	if (buffer_id == 0 || bufferFound == ctx.buffer_objects.end() || !bufferFound->second || offset < 0 ||
++		ctx.buffer_mappings.count(buffer_id)) {
+ 		gl4metalSetError(GL_INVALID_OPERATION);
+ 		return false;
+ 	}
+@@ -648,6 +679,7 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
+ 			computeBufferSizes[storageInfo.slot] = (uint32_t)resolved.size;
+ 		}
+ 		storageBufferBindings.push_back(resolved);
++		invalidateConvertedVertexBuffers(binding.buffer);
+ 		addUniqueBufferName(usedBufferNames, binding.buffer);
+ 	}
+ 
+@@ -735,67 +767,13 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
+ 		}
+ 	}
+ 
+-	// Image binding points are GL image units; Metal texture slots are remapped
+-	// independently by the translator after all sampled textures. image3D maps to
+-	// a layered MTLTextureType3D; image2D remains a non-layered MTLTextureType2D.
+ 	for (size_t imageIndex = 0; imageIndex < program->storage_images.size(); ++imageIndex) {
+-		const TranslatedImage &imageInfo = program->storage_images[imageIndex];
+-		const GLint imageUnit = imageIndex < program->image_units.size()
+-			? program->image_units[imageIndex] : -1;
+-		if (imageUnit < 0 || imageUnit >= GL4METAL_MAX_IMAGE_UNITS || imageInfo.slot >= 32) {
+-			gl4metalSetError(GL_INVALID_OPERATION);
+-			GL4METAL_LOG("glDispatchCompute: image '%s' has invalid image unit %d or Metal slot %u",
+-				imageInfo.name.c_str(), imageUnit, imageInfo.slot);
+-			return;
+-		}
+-		const ImageUnitBinding &binding = ctx.image_unit_bindings[(GLuint)imageUnit];
+-		auto textureObject = ctx.texture_objects.find(binding.texture);
+-		const GLenum expectedTarget = imageInfo.is_3d ? GL_TEXTURE_3D : GL_TEXTURE_2D;
+-		const MTLTextureType expectedType = imageInfo.is_3d ? MTLTextureType3D : MTLTextureType2D;
+-		const bool invalidLayerMode = imageInfo.is_3d
+-			? binding.layered != GL_TRUE
+-			: binding.layer != 0;
+-		// GL ignores the layered flag for a plain GL_TEXTURE_2D image binding;
+-		// its only valid layer index is zero. image3D requires a layered binding.
+-		const bool invalidTextureBinding = binding.texture == 0 || textureObject == ctx.texture_objects.end() ||
+-			textureObject->second.target != expectedTarget || !textureObject->second.texture ||
+-			textureObject->second.texture.textureType != expectedType || binding.level != 0 ||
+-			invalidLayerMode || binding.format != (textureObject == ctx.texture_objects.end() ? 0 : textureObject->second.internalformat) ||
+-			(imageInfo.format != 0 && binding.format != imageInfo.format);
+-		if (invalidTextureBinding) {
+-			gl4metalSetError(GL_INVALID_OPERATION);
+-			static std::atomic<uint64_t> imageBindingFailureCount{0};
+-			const uint64_t failureNumber = imageBindingFailureCount.fetch_add(1, std::memory_order_relaxed);
+-			if (failureNumber < 8 || (failureNumber & (failureNumber - 1)) == 0) {
+-				const GLenum actualTarget = textureObject == ctx.texture_objects.end() ? 0 : textureObject->second.target;
+-				const MTLTextureType actualType = (textureObject == ctx.texture_objects.end() || !textureObject->second.texture)
+-					? MTLTextureType2D : textureObject->second.texture.textureType;
+-				const GLenum actualFormat = textureObject == ctx.texture_objects.end() ? 0 : textureObject->second.internalformat;
+-				GL4METAL_LOG("glDispatchCompute: ctx=%p image '%s' binding mismatch unit=%u texture=%u target=0x%X type=%u level=%d layered=%u layer=%d access=0x%X format=0x%X storage=0x%X expected=%s; occurrence=%llu",
+-					(void *)&ctx, imageInfo.name.c_str(), (GLuint)imageUnit, binding.texture, actualTarget,
+-					(unsigned)actualType, binding.level, (unsigned)binding.layered,
+-					binding.layer, binding.access, binding.format, actualFormat,
+-					imageInfo.is_3d ? "layered GL_TEXTURE_3D" : "GL_TEXTURE_2D",
+-					(unsigned long long)(failureNumber + 1));
+-			}
+-			return;
+-		}
+-		if ((imageInfo.read_only && binding.access == GL_WRITE_ONLY) ||
+-			(imageInfo.write_only && binding.access == GL_READ_ONLY)) {
+-			gl4metalSetError(GL_INVALID_OPERATION);
+-			GL4METAL_LOG("glDispatchCompute: image access for '%s' is incompatible with glBindImageTexture", imageInfo.name.c_str());
+-			return;
+-		}
+-		const MTLTextureUsage usage = textureObject->second.texture.usage;
+-		if ((!imageInfo.read_only && (usage & MTLTextureUsageShaderWrite) == 0) ||
+-			(!imageInfo.write_only && (usage & MTLTextureUsageShaderRead) == 0)) {
+-			gl4metalSetError(GL_INVALID_OPERATION);
+-			GL4METAL_LOG("glDispatchCompute: image '%s' does not have the required Metal ShaderRead/ShaderWrite usage", imageInfo.name.c_str());
+-			return;
+-		}
++		const auto &stage = program->storage_images[imageIndex].stage[2];
++		if (!stage.present) continue;
+ 		ComputeTextureBinding resolved;
+-		resolved.texture = textureObject->second.texture;
+-		resolved.slot = imageInfo.slot;
++		resolved.texture = resolveImageTexture(*program, imageIndex, 2);
++		if (!resolved.texture) return;
++		resolved.slot = stage.slot;
+ 		imageTextureBindings.push_back(resolved);
+ 	}
+ 
+@@ -972,6 +950,7 @@ void glLinkProgram(GLuint program) {
+ 	p.frag_outputs.clear();
+ 	p.blocks.clear();
+ 	p.uses_gl_frag_coord = false;
++	for (auto &needs : p.needs_buffer_size_buffer) needs = false;
+ 
+ 	const ShaderObject *vs = nullptr;
+ 	const ShaderObject *fs = nullptr;
+@@ -1014,7 +993,7 @@ void glLinkProgram(GLuint program) {
+ 
+ 	// GLSL -> SPIR-V -> MSL for both stages at once (see shadertranslator.cpp).
+ 	TranslatedProgram tp;
+-	if (!translateProgram(vs->source, fs->source, tp, p.frag_data_bindings)) {
++	if (!translateProgram(vs->source, fs->source, tp, p.frag_data_bindings, shaderMSLVersion())) {
+ 		p.info_log = tp.log;
+ 		GL4METAL_LOG("glLinkProgram(%u): translation failed:\n%s", program, tp.log.c_str());
+ 		return;
+@@ -1051,6 +1030,7 @@ void glLinkProgram(GLuint program) {
+ 	// The translator reflects storage blocks independently of UBOs and samplers.
+ 	// Preserve this GL-facing reflection for indexed binding and program-interface queries.
+ 	p.storage_buffers = tp.storage_buffers;
++	p.storage_images = tp.storage_images;
+ 	for (int stage = 0; stage < 3; ++stage)
+ 		p.needs_buffer_size_buffer[stage] = tp.needs_buffer_size_buffer[stage];
+ 
+@@ -1100,6 +1080,7 @@ void glLinkProgram(GLuint program) {
+ 		nextLocation += u.array_size;
+ 		p.uniforms.push_back(pu);
+ 	}
++	appendImageUniforms(p, nextLocation);
+ 	p.uniform_data[0].assign(tp.block_size[0], 0); // GL uniforms start at 0
+ 	p.uniform_data[1].assign(tp.block_size[1], 0);
+ 	for (const auto &output : tp.frag_outputs) {
+@@ -1109,7 +1090,7 @@ void glLinkProgram(GLuint program) {
+ 	for (const TranslatedBlock &tb : tp.blocks) {
+ 		ProgramBlock pb;
+ 		pb.info = tb;
+-		pb.binding_point = 0; // graphics UBO binding defaults to 0 until glUniformBlockBinding
++		pb.binding_point = tb.binding;
+ 		p.blocks.push_back(pb);
+ 	}
+ 
+@@ -1118,14 +1099,16 @@ void glLinkProgram(GLuint program) {
+ 	for (const ProgramUniform &uniform : p.uniforms) {
+ 		ActiveUniformInfo active;
+ 		active.name = activeUniformName(uniform.info);
+-		active.type = activeUniformGLType(uniform.info);
++		active.type = uniform.is_image ? uniform.opaque_gl_type : activeUniformGLType(uniform.info);
+ 		active.size = uniform.info.array_size;
+ 		active.block_index = -1;
+-		const TranslatedUniform::Stage &stage = uniform.info.stage[uniform.info.stage[0].present ? 0 : 1];
+-		active.offset = (GLint)stage.offset;
+-		active.array_stride = (GLint)stage.array_stride;
+-		active.matrix_stride = (GLint)stage.matrix_stride;
+-		active.row_major = stage.row_major ? GL_TRUE : GL_FALSE;
++		if (!uniform.is_image) {
++			const TranslatedUniform::Stage &stage = uniform.info.stage[uniform.info.stage[0].present ? 0 : 1];
++			active.offset = (GLint)stage.offset;
++			active.array_stride = (GLint)stage.array_stride;
++			active.matrix_stride = (GLint)stage.matrix_stride;
++			active.row_major = stage.row_major ? GL_TRUE : GL_FALSE;
++		}
+ 		p.active_uniforms.push_back(std::move(active));
+ 	}
+ 	for (size_t blockIndex = 0; blockIndex < p.blocks.size(); ++blockIndex) {
+diff --git a/gl4metal/shaders.mm b/gl4metal/shaders.mm
+index 4092c8360113ef56a412bad8e7d82cd3067f44ff..556be1cc9b71faac64fb93481c0a1a873d8696c0 100644
+--- a/gl4metal/shaders.mm
++++ b/gl4metal/shaders.mm
+@@ -77,9 +77,10 @@ void glCompileShader(GLuint shader) {
+ 		return;
+ 	}
+ 
+-	// GLSL is only stored here. The GLSL -> MSL translation needs both stages and their interface,
+-	// so it belongs to glLinkProgram.
+-	s.compiled = GL_TRUE;
++	// Compute has a self-contained interface and can report GLSL errors now.
++	// Graphics translation still needs both stages and happens at glLinkProgram.
++	s.compiled = s.type == GL_COMPUTE_SHADER
++		? (validateComputeShader(s.source, s.info_log) ? GL_TRUE : GL_FALSE) : GL_TRUE;
+ 
+ 	const char *dump = getenv("GL4METAL_DUMP_SHADERS");
+ 	if (dump && dump[0] == '1') {
+diff --git a/gl4metal/shadertranslator.cpp b/gl4metal/shadertranslator.cpp
+index 097fa59330ec4b77d8427e0b0cbdc70b8dfe1a87..7c7bffa6661f1f3b50e70e45fc898e249b7960e1 100644
+--- a/gl4metal/shadertranslator.cpp
++++ b/gl4metal/shadertranslator.cpp
+@@ -13,6 +13,7 @@
+ #include <cstdint>
+ #include <exception>
+ #include <limits>
++#include <mutex>
+ #include <utility>
+ #include <vector>
+ #include <regex>
+@@ -29,11 +30,8 @@ namespace {
+ enum Stage { VS = 0, FS = 1 };
+ 
+ void initGlslang() {
+-	glslang::InitializeProcess();
+-}
+-
+-void finalizeGlslang() {
+-	glslang::FinalizeProcess();
++	static std::once_flag initialized;
++	std::call_once(initialized, [] { glslang::InitializeProcess(); });
+ }
+ 
+ // glslang's generic defaults are intentionally conservative (notably only eight
+@@ -51,14 +49,14 @@ TBuiltInResource makeGL4MetalShaderResources() {
+ 	limits.maxVaryingVectors = 15;
+ 	limits.maxVaryingComponents = 60;
+ 	limits.maxImageUnits = GL4METAL_MAX_IMAGE_UNITS;
+-	limits.maxVertexImageUniforms = 0;
+-	limits.maxFragmentImageUniforms = 0;
++	limits.maxVertexImageUniforms = GL4METAL_MAX_IMAGE_UNITS;
++	limits.maxFragmentImageUniforms = GL4METAL_MAX_IMAGE_UNITS;
+ 	limits.maxComputeImageUniforms = GL4METAL_MAX_IMAGE_UNITS;
+-	limits.maxCombinedImageUniforms = GL4METAL_MAX_IMAGE_UNITS;
++	limits.maxCombinedImageUniforms = 2 * GL4METAL_MAX_IMAGE_UNITS;
+ 	limits.maxCombinedImageUnitsAndFragmentOutputs =
+ 		GL4METAL_MAX_IMAGE_UNITS + GL4METAL_MAX_FRAGMENT_OUTPUTS;
+ 	// max(graphics SSBO blocks + fragment outputs, compute SSBO blocks + images).
+-	limits.maxCombinedShaderOutputResources = 49;
++	limits.maxCombinedShaderOutputResources = 41 + 2 * GL4METAL_MAX_IMAGE_UNITS + GL4METAL_MAX_FRAGMENT_OUTPUTS;
+ 	return limits;
+ }
+ 
+@@ -1445,15 +1443,14 @@ static size_t widenMslFragmentColorOutputs(std::string &source,
+ 	return widened;
+ }
+ 
+-static std::unordered_map<std::string, uint32_t> collectStorageBlockBindings(const std::string &source);
+-
+ // GL_BUFFER_DATA_SIZE for an SSBO is the minimum storage needed by the block.
+ // For a final runtime-sized array, include one element's std430 stride; applications
+ // can use TOP_LEVEL_ARRAY_STRIDE to size larger ranges. SPIRV-Cross provides the
+ // effective member offsets, sizes and strides through this API.
+ static bool storageBlockRequiredSize(spirv_cross::CompilerMSL &compiler,
+-	const spirv_cross::SPIRType &storageType, uint32_t &requiredSize) {
++	const spirv_cross::SPIRType &storageType, uint32_t &requiredSize, uint32_t &dataSize) {
+ 	size_t requiredBytes = 0;
++	size_t reportedBytes = 0;
+ 	try {
+ 		for (uint32_t memberIndex = 0; memberIndex < storageType.member_types.size(); ++memberIndex) {
+ 			const spirv_cross::SPIRType &memberType = compiler.get_type(storageType.member_types[memberIndex]);
+@@ -1469,6 +1466,10 @@ static bool storageBlockRequiredSize(spirv_cross::CompilerMSL &compiler,
+ 				memberSize = compiler.get_declared_struct_member_size(storageType, memberIndex);
+ 			}
+ 			if (memberOffset > std::numeric_limits<size_t>::max() - memberSize) return false;
++			reportedBytes = std::max(reportedBytes, memberOffset + memberSize);
++			// A bound range may expose zero tail elements. ArrayLength uses the
++			// actual range size, while GL_BUFFER_DATA_SIZE still reports one element.
++			if (!memberType.array.empty() && memberType.array.back() == 0) memberSize = 0;
+ 			requiredBytes = std::max(requiredBytes, memberOffset + memberSize);
+ 		}
+ 	} catch (const std::exception &) {
+@@ -1476,8 +1477,143 @@ static bool storageBlockRequiredSize(spirv_cross::CompilerMSL &compiler,
+ 		// an undersized MTLBuffer to generated device-pointer accesses.
+ 		return false;
+ 	}
+-	if (requiredBytes > (size_t)UINT32_MAX) return false;
++	if (reportedBytes > (size_t)UINT32_MAX) return false;
+ 	requiredSize = (uint32_t)requiredBytes;
++	dataSize = (uint32_t)reportedBytes;
++	return true;
++}
++
++// Reflect SSBO leaves recursively. A top-level array is represented by element zero;
++// nested arrays of structs have separate resource names, as required by GL 4.3.
++// Keep integer values and offsets in their original std430/std140 layout.
++static void reflectStorageType(spirv_cross::CompilerMSL &msl, uint32_t typeID,
++	const std::string &name, uint32_t offset, bool topLevel, int topSize, uint32_t topStride,
++	uint32_t matrixStride, bool rowMajor, int stage, TranslatedStorageBuffer &block) {
++	const auto &type = msl.get_type(typeID);
++	if (!type.array.empty()) {
++		const uint32_t count = type.array.back();
++		const uint32_t stride = msl.get_decoration(typeID, spv::DecorationArrayStride);
++		if (topLevel) { topSize = (int)count; topStride = stride; }
++		if (count == 0) block.runtime_sized = true;
++		if (type.basetype == spirv_cross::SPIRType::Struct || type.array.size() > 1) {
++			const uint32_t reflectedCount = topLevel ? 1u : std::max(1u, count);
++			for (uint32_t i = 0; i < reflectedCount; ++i)
++				reflectStorageType(msl, type.parent_type, name + "[" + std::to_string(i) + "]",
++					offset + i * stride, false, topSize, topStride, matrixStride, rowMajor, stage, block);
++			return;
++		}
++	}
++	if (type.basetype == spirv_cross::SPIRType::Struct) {
++		for (uint32_t i = 0; i < type.member_types.size(); ++i) {
++			const auto &member = msl.get_type(type.member_types[i]);
++			reflectStorageType(msl, type.member_types[i], name + "." + msl.get_member_name(type.self, i),
++				offset + msl.type_struct_member_offset(type, i), false, topSize, topStride,
++				member.columns > 1 ? msl.type_struct_member_matrix_stride(type, i) : 0,
++				msl.has_member_decoration(type.self, i, spv::DecorationRowMajor), stage, block);
++		}
++		return;
++	}
++	auto found = std::find_if(block.members.begin(), block.members.end(),
++		[&](const TranslatedUniform &member) { return member.name == name; });
++	if (found == block.members.end()) {
++		block.members.emplace_back();
++		found = block.members.end() - 1;
++	}
++	auto &member = *found;
++	member.name = name;
++	member.kind = kindOf(type.basetype);
++	member.vecsize = (int)type.vecsize;
++	member.columns = (int)type.columns;
++	member.is_array = !type.array.empty();
++	member.array_size = type.array.empty() ? 1 : (int)type.array.back();
++	member.top_level_array_size = topSize;
++	member.top_level_array_stride = topStride;
++	member.stage[stage].present = true;
++	member.stage[stage].offset = offset;
++	member.stage[stage].array_stride = type.array.empty() ? 0 : msl.get_decoration(typeID, spv::DecorationArrayStride);
++	member.stage[stage].matrix_stride = matrixStride;
++	member.stage[stage].row_major = rowMajor;
++}
++
++static void reflectStorageMembers(spirv_cross::CompilerMSL &msl, const spirv_cross::Resource &resource,
++	int stage, TranslatedStorageBuffer &block) {
++	const auto &type = msl.get_type(resource.base_type_id);
++	// An anonymous block exposes members in the global namespace. SPIR-V's
++	// variable name is empty in that case; resource.name is the block type name.
++	const std::string prefix = msl.get_name(resource.id).empty() ? "" : msl.get_name(resource.base_type_id) + ".";
++	for (uint32_t i = 0; i < type.member_types.size(); ++i) {
++		const auto &member = msl.get_type(type.member_types[i]);
++		reflectStorageType(msl, type.member_types[i], prefix + msl.get_member_name(type.self, i),
++			msl.type_struct_member_offset(type, i), true, 1, 0,
++			member.columns > 1 ? msl.type_struct_member_matrix_stride(type, i) : 0,
++			msl.has_member_decoration(type.self, i, spv::DecorationRowMajor), stage, block);
++	}
++	block.active_variable_count = (uint32_t)block.members.size();
++}
++
++static uint32_t glImageFormatForSpirv(spv::ImageFormat format);
++
++static std::unordered_map<uint32_t, uint32_t> imageBindings(spirv_cross::CompilerMSL &msl,
++	const spirv_cross::ShaderResources &resources) {
++	std::unordered_map<uint32_t, uint32_t> result;
++	for (const auto &resource : resources.storage_images)
++		result[resource.id] = msl.has_decoration(resource.id, spv::DecorationBinding)
++			? msl.get_decoration(resource.id, spv::DecorationBinding) : 0;
++	return result;
++}
++
++static bool reflectStorageImages(spirv_cross::CompilerMSL &msl, const spirv_cross::ShaderResources &resources,
++	const std::unordered_map<uint32_t, uint32_t> &originalBindings, spv::ExecutionModel model,
++	int stage, uint32_t nextSlot, TranslatedProgram &out) {
++	for (const auto &resource : resources.storage_images) {
++		const auto &type = msl.get_type(resource.type_id);
++		const bool is3D = type.image.dim == spv::Dim3D;
++		if ((!is3D && type.image.dim != spv::Dim2D) || type.image.arrayed || type.image.ms) {
++			out.log += "storage image '" + resource.name + "' requires a non-multisampled image2D or image3D\n";
++			return false;
++		}
++		const uint32_t count = (uint32_t)arraySizeOf(type);
++		const uint32_t glBinding = originalBindings.at(resource.id);
++		if (count == 0 || glBinding >= GL4METAL_MAX_IMAGE_UNITS || count > GL4METAL_MAX_IMAGE_UNITS - glBinding ||
++			nextSlot > 32 || count > 32 - nextSlot) {
++			out.log += "storage image '" + resource.name + "' exceeds image-unit or Metal texture-slot limits\n";
++			return false;
++		}
++		spirv_cross::MSLResourceBinding binding;
++		binding.stage = model;
++		binding.desc_set = msl.get_decoration(resource.id, spv::DecorationDescriptorSet);
++		binding.binding = msl.get_decoration(resource.id, spv::DecorationBinding);
++		binding.msl_texture = nextSlot;
++		binding.count = count;
++		msl.add_msl_resource_binding(binding);
++		const auto base = msl.get_type(type.image.type).basetype;
++		const uint32_t glType = base == spirv_cross::SPIRType::Int ? (is3D ? GL_INT_IMAGE_3D : GL_INT_IMAGE_2D) :
++			base == spirv_cross::SPIRType::UInt ? (is3D ? GL_UNSIGNED_INT_IMAGE_3D : GL_UNSIGNED_INT_IMAGE_2D) :
++			(is3D ? GL_IMAGE_3D : GL_IMAGE_2D);
++		for (uint32_t i = 0; i < count; ++i) {
++			const std::string name = type.array.empty() ? resource.name : resource.name + "[" + std::to_string(i) + "]";
++			auto found = std::find_if(out.storage_images.begin(), out.storage_images.end(),
++				[&](const TranslatedImage &image) { return image.name == name; });
++			if (found == out.storage_images.end()) {
++				out.storage_images.emplace_back();
++				found = out.storage_images.end() - 1;
++				found->name = name;
++				found->binding = glBinding + i;
++				found->gl_type = glType;
++				found->format = glImageFormatForSpirv(type.image.format);
++				found->is_3d = is3D;
++			} else if (found->binding != glBinding + i || found->gl_type != glType ||
++				found->format != glImageFormatForSpirv(type.image.format)) {
++				out.log += "storage image '" + name + "' has inconsistent declarations across stages\n";
++				return false;
++			}
++			found->slot = nextSlot + i;
++			found->read_only = msl.has_decoration(resource.id, spv::DecorationNonWritable);
++			found->write_only = msl.has_decoration(resource.id, spv::DecorationNonReadable);
++			found->stage[stage] = {true, nextSlot + i, found->read_only, found->write_only};
++		}
++		nextSlot += count;
++	}
+ 	return true;
+ }
+ 
+@@ -1489,14 +1625,13 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
+ 	bool alignFragmentInputs,
+ 	const std::vector<std::pair<std::string, uint32_t>> &explicitFragmentOutputLayouts,
+ 	const std::unordered_map<std::string, uint32_t> &fragDataBindings,
+-	const std::unordered_map<std::string, uint32_t> &storageBlockBindings,
+-	TranslatedProgram &out, TranslationLookup &lookup) {
++	TranslatedProgram &out, TranslationLookup &lookup, uint32_t mslVersion) {
+ 	try {
+ 		spirv_cross::CompilerMSL msl(std::move(spirv));
+ 
+ 		spirv_cross::CompilerMSL::Options options;
+ 		options.platform = spirv_cross::CompilerMSL::Options::iOS;
+-		options.set_msl_version(2, 4);
++		options.msl_version = mslVersion;
+ 		options.buffer_size_buffer_index = GL4METAL_BUFFER_SIZE_BUFFER_INDEX;
+ 		msl.set_msl_options(options);
+ 
+@@ -1542,15 +1677,12 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
+ 		// space even though Metal places them in different resource namespaces.
+ 		// OpenGL sampler uniforms may carry the same default binding, so uniquify
+ 		// all resources participating in the explicit SPIRV-Cross remap table.
++		const auto originalImageBindings = imageBindings(msl, resources);
+ 		std::unordered_map<uint32_t, uint32_t> originalStorageBindings;
+ 		originalStorageBindings.reserve(resources.storage_buffers.size());
+ 		for (const spirv_cross::Resource &resource : resources.storage_buffers) {
+-			const std::string blockName = msl.get_name(resource.base_type_id);
+-			auto sourceBinding = storageBlockBindings.find(blockName);
+-			const uint32_t bindingPoint = sourceBinding != storageBlockBindings.end()
+-				? sourceBinding->second
+-				: (msl.has_decoration(resource.id, spv::DecorationBinding)
+-					? msl.get_decoration(resource.id, spv::DecorationBinding) : 0u);
++			const uint32_t bindingPoint = msl.has_decoration(resource.id, spv::DecorationBinding)
++				? msl.get_decoration(resource.id, spv::DecorationBinding) : 0u;
+ 			originalStorageBindings.emplace(resource.id, bindingPoint);
+ 		}
+ 		std::unordered_map<uint32_t, uint32_t> originalUniformBindings;
+@@ -1566,6 +1698,7 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
+ 		for (const spirv_cross::Resource &resource : resources.storage_buffers) mappedResources.push_back(&resource);
+ 		for (const spirv_cross::Resource &resource : resources.uniform_buffers) mappedResources.push_back(&resource);
+ 		for (const spirv_cross::Resource &resource : resources.sampled_images) mappedResources.push_back(&resource);
++		for (const auto &resource : resources.storage_images) mappedResources.push_back(&resource);
+ 		if (!makeMslResourceBindingKeysUnique(msl, mappedResources,
+ 			stage == VS ? "vertex" : "fragment", out.log)) return false;
+ 
+@@ -1595,6 +1728,10 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
+ 		};
+ 		for (const spirv_cross::Resource &resource : resources.storage_buffers) {
+ 			const uint32_t metalSlot = allocateStageBufferSlot();
++			if (!msl.get_type(resource.type_id).array.empty()) {
++				out.log += "arrays of shader storage blocks are not supported by direct Metal buffer bindings\n";
++				return false;
++			}
+ 			if (metalSlot == UINT32_MAX) {
+ 				out.log += std::string(stage == VS ? "vertex" : "fragment") +
+ 					" stage exhausts Metal buffer slots while mapping shader storage blocks\n";
+@@ -1639,45 +1776,14 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
+ 			reflected->stage[stage].slot = metalSlot;
+ 
+ 			const spirv_cross::SPIRType &storageType = msl.get_type(resource.base_type_id);
+-			uint32_t requiredSize = 0;
+-			if (!storageBlockRequiredSize(msl, storageType, requiredSize)) {
++			uint32_t requiredSize = 0, dataSize = 0;
++			if (!storageBlockRequiredSize(msl, storageType, requiredSize, dataSize)) {
+ 				out.log += "could not compute a safe fixed-size prefix for shader storage block '" + blockName + "'\n";
+ 				return false;
+ 			}
+ 			reflected->required_size = std::max(reflected->required_size, requiredSize);
+-			for (uint32_t memberIndex = 0; memberIndex < storageType.member_types.size(); ++memberIndex) {
+-				const spirv_cross::SPIRType &memberType = msl.get_type(storageType.member_types[memberIndex]);
+-				if (!memberType.array.empty() && memberType.array.back() == 0) reflected->runtime_sized = true;
+-				if (memberType.basetype == spirv_cross::SPIRType::Struct) {
+-					out.log += "SSBO member '" + msl.get_member_name(resource.base_type_id, memberIndex) +
+-						"' is a nested struct; nested GL_BUFFER_VARIABLE reflection is not supported\n";
+-					continue;
+-				}
+-				const std::string memberPrefix = resource.name.empty() ? blockName : resource.name;
+-				const std::string memberName = memberPrefix + "." + msl.get_member_name(resource.base_type_id, memberIndex);
+-				auto memberFound = std::find_if(reflected->members.begin(), reflected->members.end(),
+-					[&memberName](const TranslatedUniform &candidate) { return candidate.name == memberName; });
+-				TranslatedUniform *member = nullptr;
+-				if (memberFound == reflected->members.end()) {
+-					reflected->members.emplace_back();
+-					reflected->members.back().name = memberName;
+-					member = &reflected->members.back();
+-				} else {
+-					member = &*memberFound;
+-				}
+-				member->kind = kindOf(memberType.basetype);
+-				member->vecsize = (int)memberType.vecsize;
+-				member->columns = (int)memberType.columns;
+-				member->array_size = (!memberType.array.empty() && !memberType.array_size_literal.empty() &&
+-					!memberType.array_size_literal[0] && memberType.array.back() == 0) ? 0 : arraySizeOf(memberType);
+-				TranslatedUniform::Stage &memberStage = member->stage[stage];
+-				memberStage.present = true;
+-				memberStage.offset = msl.type_struct_member_offset(storageType, memberIndex);
+-				memberStage.array_stride = memberType.array.empty() ? 0 : msl.type_struct_member_array_stride(storageType, memberIndex);
+-				memberStage.matrix_stride = memberType.columns > 1 ? msl.type_struct_member_matrix_stride(storageType, memberIndex) : 0;
+-				memberStage.row_major = msl.has_member_decoration(resource.base_type_id, memberIndex, spv::DecorationRowMajor);
+-			}
+-			reflected->active_variable_count = (uint32_t)reflected->members.size();
++			reflected->data_size = std::max(reflected->data_size, dataSize);
++			reflectStorageMembers(msl, resource, stage, *reflected);
+ 		}
+ 
+ 		uint32_t nextUniformBlockBufferSlot = nextStageBufferSlot;
+@@ -1859,6 +1965,8 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
+ 			return false;
+ 		}
+ 
++		if (!reflectStorageImages(msl, resources, originalImageBindings, model, stage, slot, out)) return false;
++
+ 		if (stage == VS) {
+ 			for (const spirv_cross::Resource &r : resources.stage_inputs) {
+ 				if (r.name.compare(0, 3, "gl_") == 0) {
+@@ -1884,7 +1992,14 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
+ 		}
+ 
+ 		sanitizeMslIdentifiers(msl, resources, stage == VS ? "vertex" : "fragment", out.log);
+-		std::string compiledMsl = msl.compile();
++		std::string compiledMsl = "// gl4metal MSL " + std::to_string(mslVersion) + "\n" + msl.compile();
++		for (const auto &image : resources.storage_images) {
++			if (msl.get_automatic_msl_resource_binding_secondary(image.id) != UINT32_MAX) {
++				out.log += "image atomics require iOS 17 / MSL 3.1 and an Apple6 or newer GPU\n";
++				return false;
++			}
++		}
++
+ 		out.needs_buffer_size_buffer[stage] = msl.needs_buffer_size_buffer();
+ 		if (stage == FS) {
+ 			std::string outputNotes;
+@@ -1923,60 +2038,6 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
+ 	}
+ }
+ 
+-struct ComputeSourceBindings {
+-	std::unordered_map<std::string, uint32_t> uniformBlocks;
+-	std::unordered_map<std::string, uint32_t> storageBlocks;
+-	std::unordered_map<std::string, uint32_t> storageImages;
+-};
+-
+-static bool parseLayoutBinding(const std::string &layout, uint32_t &bindingValue) {
+-	static const std::regex bindingPattern(R"(\bbinding\s*=\s*([0-9]+))");
+-	std::smatch match;
+-	if (!std::regex_search(layout, match, bindingPattern)) return false;
+-	try {
+-		bindingValue = (uint32_t)std::stoul(match[1].str());
+-		return true;
+-	} catch (...) {
+-		return false;
+-	}
+-}
+-
+-static std::unordered_map<std::string, uint32_t> collectStorageBlockBindings(const std::string &source) {
+-	std::unordered_map<std::string, uint32_t> result;
+-	const std::string masked = maskShaderComments(source);
+-	static const std::regex storageBlockPattern(
+-		R"(layout\s*\(([^)]*)\)\s*(?:(?:readonly|writeonly|coherent|volatile|restrict)\s+)*buffer\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{)");
+-	for (std::sregex_iterator it(masked.begin(), masked.end(), storageBlockPattern), end; it != end; ++it) {
+-		uint32_t bindingValue = 0;
+-		if (parseLayoutBinding((*it)[1].str(), bindingValue)) result[(*it)[2].str()] = bindingValue;
+-	}
+-	return result;
+-}
+-
+-static ComputeSourceBindings collectComputeSourceBindings(const std::string &source) {
+-	ComputeSourceBindings result;
+-	const std::string masked = maskShaderComments(source);
+-	static const std::regex uniformBlockPattern(
+-		R"(layout\s*\(([^)]*)\)\s*uniform\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{)");
+-	static const std::regex storageBlockPattern(
+-		R"(layout\s*\(([^)]*)\)\s*(?:(?:readonly|writeonly|coherent|volatile|restrict)\s+)*buffer\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{)");
+-	static const std::regex storageImagePattern(
+-		R"(layout\s*\(([^)]*)\)\s*(?:(?:readonly|writeonly|coherent|volatile|restrict)\s+)*uniform\s+(?:(?:readonly|writeonly|coherent|volatile|restrict)\s+)*[iu]?image[A-Za-z0-9_]*\s+([A-Za-z_][A-Za-z0-9_]*))");
+-	for (std::sregex_iterator it(masked.begin(), masked.end(), uniformBlockPattern), end; it != end; ++it) {
+-		uint32_t bindingValue = 0;
+-		if (parseLayoutBinding((*it)[1].str(), bindingValue)) result.uniformBlocks[(*it)[2].str()] = bindingValue;
+-	}
+-	for (std::sregex_iterator it(masked.begin(), masked.end(), storageBlockPattern), end; it != end; ++it) {
+-		uint32_t bindingValue = 0;
+-		if (parseLayoutBinding((*it)[1].str(), bindingValue)) result.storageBlocks[(*it)[2].str()] = bindingValue;
+-	}
+-	for (std::sregex_iterator it(masked.begin(), masked.end(), storageImagePattern), end; it != end; ++it) {
+-		uint32_t bindingValue = 0;
+-		if (parseLayoutBinding((*it)[1].str(), bindingValue)) result.storageImages[(*it)[2].str()] = bindingValue;
+-	}
+-	return result;
+-}
+-
+ static uint32_t glImageFormatForSpirv(spv::ImageFormat format) {
+ 	switch (format) {
+ 		case spv::ImageFormatRgba32f: return GL_RGBA32F;
+@@ -2021,13 +2082,12 @@ static uint32_t glImageFormatForSpirv(spv::ImageFormat format) {
+ 	}
+ }
+ 
+-static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgram &out, TranslationLookup &lookup,
+-	const ComputeSourceBindings &sourceBindings) {
++static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgram &out, TranslationLookup &lookup, uint32_t mslVersion) {
+ 	try {
+ 		spirv_cross::CompilerMSL msl(std::move(spirv));
+ 		spirv_cross::CompilerMSL::Options options;
+ 		options.platform = spirv_cross::CompilerMSL::Options::iOS;
+-		options.set_msl_version(2, 2);
++		options.msl_version = mslVersion;
+ 		options.buffer_size_buffer_index = GL4METAL_BUFFER_SIZE_BUFFER_INDEX;
+ 		msl.set_msl_options(options);
+ 
+@@ -2035,8 +2095,9 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
+ 		spirv_cross::ShaderResources resources = msl.get_shader_resources(activeVariables);
+ 
+ 		// Preserve the original GL SSBO binding before uniquifying SPIR-V resource
+-		// keys for SPIRV-Cross. The source-text parser is only an optimization for
+-		// literal layout(binding=N); macro-expanded bindings must come from SPIR-V.
++		// keys for SPIRV-Cross. Constant expressions and macros have already been
++		// evaluated by glslang and must not be parsed again from the source text.
++		const auto originalImageBindings = imageBindings(msl, resources);
+ 		std::unordered_map<uint32_t, uint32_t> originalStorageBindings;
+ 		originalStorageBindings.reserve(resources.storage_buffers.size());
+ 		for (const spirv_cross::Resource &resource : resources.storage_buffers) {
+@@ -2085,6 +2146,10 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
+ 		}
+ 		for (uint32_t slot = 0; slot < storageBuffers.size(); ++slot) {
+ 			const auto &resource = *storageBuffers[slot].second;
++			if (!msl.get_type(resource.type_id).array.empty()) {
++				out.log += "arrays of shader storage blocks are not supported by direct Metal buffer bindings\n";
++				return false;
++			}
+ 			const std::string blockTypeName = msl.get_name(resource.base_type_id);
+ 			auto originalBinding = originalStorageBindings.find(resource.id);
+ 			const uint32_t glBindingPoint = originalBinding == originalStorageBindings.end() ? 0u : originalBinding->second;
+@@ -2110,34 +2175,11 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
+ 			reflected.stage[2].present = true;
+ 			reflected.stage[2].slot = slot;
+ 			const spirv_cross::SPIRType &storageType = msl.get_type(resource.base_type_id);
+-			if (!storageBlockRequiredSize(msl, storageType, reflected.required_size)) {
++			if (!storageBlockRequiredSize(msl, storageType, reflected.required_size, reflected.data_size)) {
+ 				out.log += "could not compute a safe fixed-size prefix for compute shader storage block '" + reflected.name + "'\n";
+ 				return false;
+ 			}
+-			for (uint32_t memberIndex = 0; memberIndex < storageType.member_types.size(); ++memberIndex) {
+-				const spirv_cross::SPIRType &memberType = msl.get_type(storageType.member_types[memberIndex]);
+-				if (!memberType.array.empty() && memberType.array.back() == 0) reflected.runtime_sized = true;
+-				if (memberType.basetype == spirv_cross::SPIRType::Struct) {
+-					out.log += "compute SSBO member '" + msl.get_member_name(resource.base_type_id, memberIndex) +
+-						"' is a nested struct; nested GL_BUFFER_VARIABLE reflection is not supported\n";
+-					continue;
+-				}
+-				TranslatedUniform member;
+-				const std::string memberPrefix = resource.name.empty() ? reflected.name : resource.name;
+-				member.name = memberPrefix + "." + msl.get_member_name(resource.base_type_id, memberIndex);
+-				member.kind = kindOf(memberType.basetype);
+-				member.vecsize = (int)memberType.vecsize;
+-				member.columns = (int)memberType.columns;
+-				member.array_size = (!memberType.array.empty() && !memberType.array_size_literal.empty() &&
+-					!memberType.array_size_literal[0] && memberType.array.back() == 0) ? 0 : arraySizeOf(memberType);
+-				member.stage[2].present = true;
+-				member.stage[2].offset = msl.type_struct_member_offset(storageType, memberIndex);
+-				member.stage[2].array_stride = memberType.array.empty() ? 0 : msl.type_struct_member_array_stride(storageType, memberIndex);
+-				member.stage[2].matrix_stride = memberType.columns > 1 ? msl.type_struct_member_matrix_stride(storageType, memberIndex) : 0;
+-				member.stage[2].row_major = msl.has_member_decoration(resource.base_type_id, memberIndex, spv::DecorationRowMajor);
+-				reflected.members.push_back(std::move(member));
+-			}
+-			reflected.active_variable_count = (uint32_t)reflected.members.size();
++			reflectStorageMembers(msl, resource, 2, reflected);
+ 			out.storage_buffers.push_back(std::move(reflected));
+ 		}
+ 
+@@ -2280,56 +2322,8 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
+ 			}
+ 		}
+ 
+-		for (const spirv_cross::Resource &resource : resources.storage_images) {
+-			const spirv_cross::SPIRType &imageType = msl.get_type(resource.type_id);
+-			// Metal can expose a GL image3D as texture3d with read/write access. The
+-			// GL_TEXTURE_3D allocation path is already private + ShaderRead/ShaderWrite.
+-			// 2D-array/cube storage images remain explicitly unsupported until their GL
+-			// texture allocation and view-binding paths are implemented as well.
+-			const bool is2D = imageType.image.dim == spv::Dim2D && !imageType.image.arrayed;
+-			const bool is3D = imageType.image.dim == spv::Dim3D && !imageType.image.arrayed;
+-			if ((!is2D && !is3D) || imageType.image.ms) {
+-				out.log += "compute storage image '" + resource.name +
+-				"' has unsupported dimension (supported: image2D and image3D; no arrayed or multisample images)\n";
+-				return false;
+-			}
+-			const uint32_t resourceCount = (uint32_t)arraySizeOf(imageType);
+-			const uint32_t spirvBinding = msl.get_decoration(resource.id, spv::DecorationBinding);
+-			auto sourceBinding = sourceBindings.storageImages.find(resource.name);
+-			const uint32_t bindingPoint = sourceBinding == sourceBindings.storageImages.end() ? 0 : sourceBinding->second;
+-			if (resourceCount == 0 || resourceCount > GL4METAL_MAX_IMAGE_UNITS) {
+-				out.log += "compute storage image array has an invalid element count\n";
+-				return false;
+-			}
+-			if (bindingPoint >= GL4METAL_MAX_IMAGE_UNITS || resourceCount > GL4METAL_MAX_IMAGE_UNITS - bindingPoint) {
+-				out.log += "compute storage-image binding range exceeds GL4Metal's 32 image units\n";
+-				return false;
+-			}
+-			if (resourceCount > 32u - nextTextureSlot) {
+-				out.log += "compute shader exceeds the 32 Metal texture binding slots\n";
+-				return false;
+-			}
+-			spirv_cross::MSLResourceBinding binding;
+-			binding.stage = spv::ExecutionModelGLCompute;
+-			binding.desc_set = msl.get_decoration(resource.id, spv::DecorationDescriptorSet);
+-			binding.binding = spirvBinding;
+-			binding.msl_texture = nextTextureSlot;
+-			binding.count = resourceCount;
+-			msl.add_msl_resource_binding(binding);
+-
+-			for (uint32_t element = 0; element < resourceCount; ++element) {
+-				TranslatedImage image;
+-				image.name = resourceCount > 1 ? resource.name + "[" + std::to_string(element) + "]" : resource.name;
+-				image.binding = bindingPoint + element;
+-				image.slot = nextTextureSlot + element;
+-				image.format = glImageFormatForSpirv(imageType.image.format);
+-				image.is_3d = is3D;
+-				image.read_only = msl.has_decoration(resource.id, spv::DecorationNonWritable);
+-				image.write_only = msl.has_decoration(resource.id, spv::DecorationNonReadable);
+-				out.storage_images.push_back(std::move(image));
+-			}
+-			nextTextureSlot += resourceCount;
+-		}
++		if (!reflectStorageImages(msl, resources, originalImageBindings, spv::ExecutionModelGLCompute,
++			2, nextTextureSlot, out)) return false;
+ 
+ 		out.workgroup_size[0] = msl.get_execution_mode_argument(spv::ExecutionModeLocalSize, 0);
+ 		out.workgroup_size[1] = msl.get_execution_mode_argument(spv::ExecutionModeLocalSize, 1);
+@@ -2340,7 +2334,14 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
+ 		}
+ 
+ 		sanitizeMslIdentifiers(msl, resources, "compute", out.log);
+-		out.msl[2] = msl.compile();
++		out.msl[2] = "// gl4metal MSL " + std::to_string(mslVersion) + "\n" + msl.compile();
++		for (const auto &image : resources.storage_images) {
++			if (msl.get_automatic_msl_resource_binding_secondary(image.id) != UINT32_MAX) {
++				out.log += "image atomics require iOS 17 / MSL 3.1 and an Apple6 or newer GPU\n";
++				return false;
++			}
++		}
++
+ 		out.needs_buffer_size_buffer[2] = msl.needs_buffer_size_buffer();
+ 		return true;
+ 	} catch (const std::exception &e) {
+@@ -2490,7 +2491,7 @@ bool compactMetalThreadgroupFloat3Arrays(std::string &mslSource, std::size_t max
+ }
+ 
+ bool translateProgram(const std::string &vertexGLSL, const std::string &fragmentGLSL, TranslatedProgram &out,
+-	const std::unordered_map<std::string, uint32_t> &fragDataBindings) {
++	const std::unordered_map<std::string, uint32_t> &fragDataBindings, uint32_t mslVersion) {
+ 	out = TranslatedProgram();
+ 	initGlslang();
+ 
+@@ -2594,26 +2595,36 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
+ 	const std::unordered_map<std::string, StageVaryingInfo> noVertexOutputLocations;
+ 	const std::unordered_map<std::string, uint32_t> noFragmentOutputBindings;
+ 	const std::vector<std::pair<std::string, uint32_t>> noExplicitFragmentOutputLayouts;
+-	const auto vertexStorageBindings = collectStorageBlockBindings(vertexGLSL);
+-	const auto fragmentStorageBindings = collectStorageBlockBindings(fragmentGLSL);
+ 	if (!compileStage(std::move(spirv[VS]), spv::ExecutionModelVertex, VS, vertexHalfVaryings, false,
+ 		noVertexOutputLocations, false, noExplicitFragmentOutputLayouts, noFragmentOutputBindings,
+-		vertexStorageBindings, out, lookup) ||
++		out, lookup, mslVersion) ||
+ 		!compileStage(std::move(spirv[FS]), spv::ExecutionModelFragment, FS, fragmentHalfVaryings,
+ 		fixFragmentFragCoordY, vertexOutputLocations, alignFragmentInputs,
+-		explicitFragmentOutputLayouts, fragDataBindings, fragmentStorageBindings, out, lookup)) {
++		explicitFragmentOutputLayouts, fragDataBindings, out, lookup, mslVersion)) {
+ 		return false;
+ 	}
+ 	// Vulkan SPIR-V legalization may represent GLSL bool uniforms as 32-bit uints.
+ 	// Preserve their original desktop-GL type for glGetActiveUniform / GL_UNIFORM_TYPE.
+ 	// Likewise keep the exact samplerBuffer variant for integer/unsigned buffer samplers.
+ 	applySourceUniformTypes(out, vertexGLSL, fragmentGLSL);
+-	finalizeGlslang();
+ 	return true;
+ }
+ 
+ 
+-bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &out) {
++bool validateComputeShader(const std::string &source, std::string &log) {
++	initGlslang();
++	const std::string text = patchVersion(source, 430);
++	const char *input = text.c_str();
++	glslang::TShader shader(EShLangCompute);
++	setupShader(shader, EShLangCompute, &input);
++	const auto resources = makeGL4MetalShaderResources();
++	const auto messages = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules);
++	const bool valid = shader.parse(&resources, 430, false, messages);
++	log = std::string(shader.getInfoLog()) + shader.getInfoDebugLog();
++	return valid;
++}
++
++bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &out, uint32_t mslVersion) {
+ 	initGlslang();
+ 	out = TranslatedProgram();
+ 	std::string computeText = patchVersion(computeGLSL, 430);
+@@ -2648,9 +2659,7 @@ bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &
+ 	lookup.uniform_indices.reserve(64);
+ 	lookup.block_indices.reserve(16);
+ 	lookup.block_member_indices.reserve(128);
+-	const ComputeSourceBindings sourceBindings = collectComputeSourceBindings(computeGLSL);
+-	if (!compileComputeStage(std::move(spirv), out, lookup, sourceBindings)) return false;
++	if (!compileComputeStage(std::move(spirv), out, lookup, mslVersion)) return false;
+ 	applySourceUniformTypes(out, computeGLSL, std::string());
+-	finalizeGlslang();
+ 	return true;
+ }
+diff --git a/gl4metal/shadertranslator.h b/gl4metal/shadertranslator.h
+index d0cd413274ec33c4fb258a692ba4c6e80e0e6ee8..08a22f3c2bce4445949f32867eea3eac4d9eff19 100644
+--- a/gl4metal/shadertranslator.h
++++ b/gl4metal/shadertranslator.h
+@@ -39,6 +39,9 @@ struct TranslatedUniform {
+ 	int vecsize = 1;     // components of a vector / rows of a matrix
+ 	int columns = 1;     // > 1 for matrices
+ 	int array_size = 1;
++	bool is_array = false;
++	int top_level_array_size = 1; // GL_BUFFER_VARIABLE: outermost block-member array
++	uint32_t top_level_array_stride = 0;
+ 	Dim dim = Dim2D;     // samplers only
+ 	uint32_t sampler_gl_type = 0; // exact GL sampler enum when source reflection provides it
+ 
+@@ -77,6 +80,7 @@ struct TranslatedStorageBuffer {
+ 	uint32_t binding = 0;   // GL_SHADER_STORAGE_BUFFER binding point
+ 	uint32_t slot = 0;      // legacy compute-stage MSL [[buffer(slot)]]
+ 	uint32_t required_size = 0;
++	uint32_t data_size = 0; // GL_BUFFER_DATA_SIZE includes one element of an unsized tail
+ 	bool runtime_sized = false;
+ 	uint32_t active_variable_count = 0;
+ 	struct Stage {
+@@ -94,6 +98,13 @@ struct TranslatedImage {
+ 	bool is_3d = false;   // image3D uses a layered GL_TEXTURE_3D / MTLTextureType3D binding
+ 	bool read_only = false;
+ 	bool write_only = false;
++	uint32_t gl_type = 0; // GL_[UNSIGNED_]INT_IMAGE_* or GL_IMAGE_*
++	struct Stage {
++		bool present = false;
++		uint32_t slot = 0;
++		bool read_only = false;
++		bool write_only = false;
++	} stage[3];
+ };
+ 
+ struct TranslatedProgram {
+@@ -112,8 +123,9 @@ struct TranslatedProgram {
+ };
+ 
+ bool translateProgram(const std::string &vertexGLSL, const std::string &fragmentGLSL, TranslatedProgram &out,
+-	const std::unordered_map<std::string, uint32_t> &fragDataBindings);
+-bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &out);
++	const std::unordered_map<std::string, uint32_t> &fragDataBindings, uint32_t mslVersion = 20200);
++bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &out, uint32_t mslVersion = 20200);
++bool validateComputeShader(const std::string &source, std::string &log);
+ 
+ // Compact nested threadgroup float3 arrays to packed_float3 where the MSL
+ // array is used as private workgroup storage. This preserves float precision
+diff --git a/gl4metal/texture.h b/gl4metal/texture.h
+index e56bf557f93001f26c740e3f2c8cefc9f3b6e684..3be0b6b7551f3f17e6632480f748201900a10778 100644
+--- a/gl4metal/texture.h
++++ b/gl4metal/texture.h
+@@ -8,10 +8,15 @@
+ #include <GL/glcorearb.h>
+ #include <GL/glext.h>
+ 
++struct ProgramObject;
++
+ MTLPixelFormat metalPixelFormat(GLenum internalformat);
+ void resetTextureUploadArena(id<MTLCommandBuffer> commandBuffer);
+ void refreshTextureBufferViews(GLuint bufferObject);
+ GLint maxTextureBufferTexels(void);
++id<MTLTexture> resolveImageTexture(const ProgramObject &program, size_t imageIndex, int stage);
++bool gl4metalEncodeClearValue(GLenum internalformat, GLenum format, GLenum type, const void *data,
++	uint8_t output[16], size_t &bytes);
+ 
+ // Internal implementation hooks used by GL_ARB_clear_texture entry points.
+ void gl4metalClearTexImageImpl(GLuint texture, GLint level, GLenum format, GLenum type, const void *data);
+diff --git a/gl4metal/texture.mm b/gl4metal/texture.mm
+index 3a35a46aeae2a00c745f79cb06e997be5974ecc6..9e707d86eb01b78f2a18073656609e2190767b09 100644
+--- a/gl4metal/texture.mm
++++ b/gl4metal/texture.mm
+@@ -1,6 +1,7 @@
+ #import "texture.h"
+ 
+ #include <cmath>
++#include "imageformats.h"
+ #include <limits>
+ #include <new>
+ 
+@@ -30,8 +31,33 @@ static MTLPixelFormat rgb5A1MetalPixelFormat(void) {
+ 	return cachedFormat;
+ }
+ 
++static void enableTextureAtomics(MTLTextureDescriptor *descriptor) {
++	if (@available(iOS 17.0, *)) {
++		if ((descriptor.pixelFormat == MTLPixelFormatR32Uint || descriptor.pixelFormat == MTLPixelFormatR32Sint) &&
++			[ctx.device supportsFamily:MTLGPUFamilyApple6]) descriptor.usage |= MTLTextureUsageShaderAtomic;
++	}
++}
++
+ MTLPixelFormat metalPixelFormat(GLenum internalformat) {
+ 	switch (internalformat) {
++		case GL_R8I: return MTLPixelFormatR8Sint;
++		case GL_R8UI: return MTLPixelFormatR8Uint;
++		case GL_R16I: return MTLPixelFormatR16Sint;
++		case GL_R16UI: return MTLPixelFormatR16Uint;
++		case GL_R32I: return MTLPixelFormatR32Sint;
++		case GL_R32UI: return MTLPixelFormatR32Uint;
++		case GL_RG8I: return MTLPixelFormatRG8Sint;
++		case GL_RG8UI: return MTLPixelFormatRG8Uint;
++		case GL_RG16I: return MTLPixelFormatRG16Sint;
++		case GL_RG16UI: return MTLPixelFormatRG16Uint;
++		case GL_RG32I: return MTLPixelFormatRG32Sint;
++		case GL_RG32UI: return MTLPixelFormatRG32Uint;
++		case GL_RGBA8I: return MTLPixelFormatRGBA8Sint;
++		case GL_RGBA8UI: return MTLPixelFormatRGBA8Uint;
++		case GL_RGBA16I: return MTLPixelFormatRGBA16Sint;
++		case GL_RGBA16UI: return MTLPixelFormatRGBA16Uint;
++		case GL_RGBA32I: return MTLPixelFormatRGBA32Sint;
++		case GL_RGBA32UI: return MTLPixelFormatRGBA32Uint;
+ 		case GL_R8:
+ 		case GL_RED:
+ 			return MTLPixelFormatR8Unorm;
+@@ -375,16 +401,16 @@ static bool enqueueTextureUpload3D(id<MTLTexture> texture, GLint level,
+ static bool sourceLayout(GLenum format, int &comps, int idx[4]) {
+ 	idx[0] = idx[1] = idx[2] = idx[3] = -1;
+ 	switch (format) {
+-		case GL_RED:
++		case GL_RED_INTEGER: case GL_RED:
+ 		case GL_DEPTH_COMPONENT:
+ 		case GL_STENCIL_INDEX: comps = 1; idx[0] = 0; return true;
+ 		case GL_GREEN: comps = 1; idx[1] = 0; return true;
+ 		case GL_BLUE:  comps = 1; idx[2] = 0; return true;
+-		case GL_RG:   comps = 2; idx[0] = 0; idx[1] = 1; return true;
+-		case GL_RGB:  comps = 3; idx[0] = 0; idx[1] = 1; idx[2] = 2; return true;
+-		case GL_BGR:  comps = 3; idx[2] = 0; idx[1] = 1; idx[0] = 2; return true;
+-		case GL_RGBA: comps = 4; idx[0] = 0; idx[1] = 1; idx[2] = 2; idx[3] = 3; return true;
+-		case GL_BGRA: comps = 4; idx[2] = 0; idx[1] = 1; idx[0] = 2; idx[3] = 3; return true;
++		case GL_RG_INTEGER: case GL_RG:   comps = 2; idx[0] = 0; idx[1] = 1; return true;
++		case GL_RGB_INTEGER: case GL_RGB:  comps = 3; idx[0] = 0; idx[1] = 1; idx[2] = 2; return true;
++		case GL_BGR_INTEGER: case GL_BGR:  comps = 3; idx[2] = 0; idx[1] = 1; idx[0] = 2; return true;
++		case GL_RGBA_INTEGER: case GL_RGBA: comps = 4; idx[0] = 0; idx[1] = 1; idx[2] = 2; idx[3] = 3; return true;
++		case GL_BGRA_INTEGER: case GL_BGRA: comps = 4; idx[2] = 0; idx[1] = 1; idx[0] = 2; idx[3] = 3; return true;
+ 		default: return false;
+ 	}
+ }
+@@ -559,9 +585,51 @@ static bool packA1BGR5Pixel(const uint8_t *source, GLenum type,
+ 	return true;
+ }
+ 
++static bool integerPixelFormat(MTLPixelFormat format, bool &isSigned) {
++	switch (format) {
++		case MTLPixelFormatR8Sint: isSigned = true; return true;
++		case MTLPixelFormatR8Uint: isSigned = false; return true;
++		case MTLPixelFormatR16Sint: isSigned = true; return true;
++		case MTLPixelFormatR16Uint: isSigned = false; return true;
++		case MTLPixelFormatR32Sint: isSigned = true; return true;
++		case MTLPixelFormatR32Uint: isSigned = false; return true;
++		case MTLPixelFormatRG8Sint: isSigned = true; return true;
++		case MTLPixelFormatRG8Uint: isSigned = false; return true;
++		case MTLPixelFormatRG16Sint: isSigned = true; return true;
++		case MTLPixelFormatRG16Uint: isSigned = false; return true;
++		case MTLPixelFormatRG32Sint: isSigned = true; return true;
++		case MTLPixelFormatRG32Uint: isSigned = false; return true;
++		case MTLPixelFormatRGBA8Sint: isSigned = true; return true;
++		case MTLPixelFormatRGBA8Uint: isSigned = false; return true;
++		case MTLPixelFormatRGBA16Sint: isSigned = true; return true;
++		case MTLPixelFormatRGBA16Uint: isSigned = false; return true;
++		case MTLPixelFormatRGBA32Sint: isSigned = true; return true;
++		case MTLPixelFormatRGBA32Uint: isSigned = false; return true;
++		default: return false;
++	}
++}
++
+ // Components and bytes per component of the Metal formats we can write from the CPU.
+ static bool destLayout(MTLPixelFormat f, int &comps, int &compSize) {
+ 	switch (f) {
++		case MTLPixelFormatR8Sint: comps = 1; compSize = 1; return true;
++		case MTLPixelFormatR8Uint: comps = 1; compSize = 1; return true;
++		case MTLPixelFormatR16Sint: comps = 1; compSize = 2; return true;
++		case MTLPixelFormatR16Uint: comps = 1; compSize = 2; return true;
++		case MTLPixelFormatR32Sint: comps = 1; compSize = 4; return true;
++		case MTLPixelFormatR32Uint: comps = 1; compSize = 4; return true;
++		case MTLPixelFormatRG8Sint: comps = 2; compSize = 1; return true;
++		case MTLPixelFormatRG8Uint: comps = 2; compSize = 1; return true;
++		case MTLPixelFormatRG16Sint: comps = 2; compSize = 2; return true;
++		case MTLPixelFormatRG16Uint: comps = 2; compSize = 2; return true;
++		case MTLPixelFormatRG32Sint: comps = 2; compSize = 4; return true;
++		case MTLPixelFormatRG32Uint: comps = 2; compSize = 4; return true;
++		case MTLPixelFormatRGBA8Sint: comps = 4; compSize = 1; return true;
++		case MTLPixelFormatRGBA8Uint: comps = 4; compSize = 1; return true;
++		case MTLPixelFormatRGBA16Sint: comps = 4; compSize = 2; return true;
++		case MTLPixelFormatRGBA16Uint: comps = 4; compSize = 2; return true;
++		case MTLPixelFormatRGBA32Sint: comps = 4; compSize = 4; return true;
++		case MTLPixelFormatRGBA32Uint: comps = 4; compSize = 4; return true;
+ 		case MTLPixelFormatR8Unorm:
+ 		case MTLPixelFormatR8Snorm:         comps = 1; compSize = 1; return true;
+ 		case MTLPixelFormatRG8Unorm:
+@@ -614,6 +682,11 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
+ 	const bool packedRGBA5551 = sourceFormatValid && srcComps == 4 &&
+ 		(format == GL_RGBA || format == GL_BGRA) && isRGBA5551PackedType(type);
+ 	const MTLPixelFormat dstFormat = t.texture.pixelFormat;
++	bool dstSigned = false;
++	const bool dstIsInteger = integerPixelFormat(dstFormat, dstSigned);
++	if (dstIsInteger != integerExternalFormat(format) || (dstIsInteger && !integerScalarBytes(type))) {
++		gl4metalSetError(GL_INVALID_OPERATION); return;
++	}
+ 	const bool nativeA1BGR5 = dstFormat == MTLPixelFormatA1BGR5Unorm;
+ 	const bool rgb5A1Fallback = t.internalformat == GL_RGB5_A1 && !nativeA1BGR5 && dstFormat == MTLPixelFormatRGBA8Unorm;
+ 	const bool rgb5A1Path = nativeA1BGR5 || rgb5A1Fallback;
+@@ -631,10 +704,10 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
+ 		(!dstIs8Snorm && !dstIs16Snorm && (type == GL_BYTE || type == GL_SHORT));
+ 	if (!sourceFormatValid || (!packedRGB332 && !packedRGBA5551 && srcCompSize == 0) ||
+ 		(!rgb5A1Path && !destLayout(dstFormat, dstComps, dstCompSize)) ||
+-		(!rgb5A1Path && !packedRGB332 && !packedRGBA5551 && srcCompSize != dstCompSize) ||
++		(!dstIsInteger && !rgb5A1Path && !packedRGB332 && !packedRGBA5551 && srcCompSize != dstCompSize) ||
+ 		(packedRGB332 && (dstFormat != MTLPixelFormatRGBA8Unorm || dstComps != 4 || dstCompSize != 1)) ||
+ 		(packedRGBA5551 && !nativeA1BGR5 && (dstFormat != MTLPixelFormatRGBA8Unorm || dstComps != 4 || dstCompSize != 1)) ||
+-		(!rgb5A1Path && (incompatible16Type || incompatibleSignedType)) ||
++		(!dstIsInteger && !rgb5A1Path && (incompatible16Type || incompatibleSignedType)) ||
+ 		(isRGBA5551PackedType(type) && !packedRGBA5551) ||
+ 		(type == GL_UNSIGNED_INT_8_8_8_8_REV && srcComps != 4)) {
+ 		gl4metalSetError(GL_INVALID_ENUM);
+@@ -688,7 +761,7 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
+ 		t.internalformat == GL_RGB8_SNORM || t.internalformat == GL_SRGB8 ||
+ 		t.internalformat == GL_RGB16 || t.internalformat == GL_RGB16_SNORM ||
+ 		t.internalformat == GL_RGB16F || t.internalformat == GL_RGB32F;
+-	bool identical = (srcComps == dstComps) && !logicalRgb && !packedRGB332 && !packedRGBA5551 && !rgb5A1Path;
++	bool identical = !dstIsInteger && (srcComps == dstComps) && !logicalRgb && !packedRGB332 && !packedRGBA5551 && !rgb5A1Path;
+ 	for (int c = 0; c < dstComps && identical; c++) identical = (idx[c] == c);
+ 	if (srcRowBytes < copyRowBytes) {
+ 		gl4metalSetError(GL_INVALID_VALUE);
+@@ -725,6 +798,14 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
+ 		const uint8_t *s = src + (size_t)row * srcRowBytes;
+ 		uint8_t *d = tmp.data() + (size_t)row * tmpRowBytes;
+ 		for (GLsizei col = 0; col < w; col++, s += srcBpp, d += dstBpp) {
++			if (dstIsInteger) {
++				for (int c = 0; c < dstComps; ++c) {
++					const int64_t value = idx[c] >= 0 ? readIntegerComponent(s + size_t(idx[c]) * srcCompSize,
++						type, ctx.unpack_swap_bytes != GL_FALSE) : (c == 3 ? 1 : 0);
++					writeIntegerComponent(d + size_t(c) * dstCompSize, dstCompSize, dstSigned, value);
++				}
++				continue;
++			}
+ 			if (rgb5A1Path) {
+ 				uint16_t packed = 0;
+ 				if (!packA1BGR5Pixel(s, type, idx, srcComps, ctx.unpack_swap_bytes != GL_FALSE, packed)) {
+@@ -812,6 +893,11 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
+ 	const bool packedRGBA5551 = sourceFormatValid && srcComps == 4 &&
+ 		(format == GL_RGBA || format == GL_BGRA) && isRGBA5551PackedType(type);
+ 	const MTLPixelFormat dstFormat = t.texture.pixelFormat;
++	bool dstSigned = false;
++	const bool dstIsInteger = integerPixelFormat(dstFormat, dstSigned);
++	if (dstIsInteger != integerExternalFormat(format) || (dstIsInteger && !integerScalarBytes(type))) {
++		gl4metalSetError(GL_INVALID_OPERATION); return;
++	}
+ 	const bool nativeA1BGR5 = dstFormat == MTLPixelFormatA1BGR5Unorm;
+ 	const bool rgb5A1Fallback = t.internalformat == GL_RGB5_A1 && !nativeA1BGR5 && dstFormat == MTLPixelFormatRGBA8Unorm;
+ 	const bool rgb5A1Path = nativeA1BGR5 || rgb5A1Fallback;
+@@ -831,10 +917,10 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
+ 		(!dstIs8Snorm && !dstIs16Snorm && (type == GL_BYTE || type == GL_SHORT));
+ 	if (!sourceFormatValid || (!packedRGB332 && !packedRGBA5551 && srcCompSize == 0) ||
+ 		(!rgb5A1Path && !destLayout(dstFormat, dstComps, dstCompSize)) ||
+-		(!rgb5A1Path && !packedRGB332 && !packedRGBA5551 && srcCompSize != dstCompSize) ||
++		(!dstIsInteger && !rgb5A1Path && !packedRGB332 && !packedRGBA5551 && srcCompSize != dstCompSize) ||
+ 		(packedRGB332 && (dstFormat != MTLPixelFormatRGBA8Unorm || dstComps != 4 || dstCompSize != 1)) ||
+ 		(packedRGBA5551 && !nativeA1BGR5 && (dstFormat != MTLPixelFormatRGBA8Unorm || dstComps != 4 || dstCompSize != 1)) ||
+-		(!rgb5A1Path && (incompatible16Type || incompatibleSignedType)) ||
++		(!dstIsInteger && !rgb5A1Path && (incompatible16Type || incompatibleSignedType)) ||
+ 		(isRGBA5551PackedType(type) && !packedRGBA5551) ||
+ 		(type == GL_UNSIGNED_INT_8_8_8_8_REV && srcComps != 4)) {
+ 		gl4metalSetError(GL_INVALID_ENUM);
+@@ -891,7 +977,7 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
+ 		t.internalformat == GL_RGB8_SNORM || t.internalformat == GL_SRGB8 ||
+ 		t.internalformat == GL_RGB16 || t.internalformat == GL_RGB16_SNORM ||
+ 		t.internalformat == GL_RGB16F || t.internalformat == GL_RGB32F;
+-	bool identical = (srcComps == dstComps) && !logicalRgb && !packedRGB332 && !packedRGBA5551 && !rgb5A1Path;
++	bool identical = !dstIsInteger && (srcComps == dstComps) && !logicalRgb && !packedRGB332 && !packedRGBA5551 && !rgb5A1Path;
+ 	for (int c = 0; c < dstComps && identical; ++c) identical = (idx[c] == c);
+ 	if (srcRowBytes < copyRowBytes) {
+ 		gl4metalSetError(GL_INVALID_VALUE);
+@@ -943,6 +1029,14 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
+ 			for (GLsizei col = 0; col < w; ++col) {
+ 				const uint8_t *sp = sourceRow + (size_t)col * srcBpp;
+ 				uint8_t *dp = destRow + (size_t)col * dstBpp;
++				if (dstIsInteger) {
++					for (int c = 0; c < dstComps; ++c) {
++						const int64_t value = idx[c] >= 0 ? readIntegerComponent(sp + size_t(idx[c]) * srcCompSize,
++							type, ctx.unpack_swap_bytes != GL_FALSE) : (c == 3 ? 1 : 0);
++						writeIntegerComponent(dp + size_t(c) * dstCompSize, dstCompSize, dstSigned, value);
++					}
++					continue;
++				}
+ 				if (rgb5A1Path) {
+ 					uint16_t packed = 0;
+ 					if (!packA1BGR5Pixel(sp, type, idx, srcComps, ctx.unpack_swap_bytes != GL_FALSE, packed)) {
+@@ -1292,7 +1386,7 @@ static id<MTLTexture> makeBufferTextureView(GLuint bufferObject, GLenum internal
+ 	descriptor.mipmapLevelCount = 1;
+ 	descriptor.sampleCount = 1;
+ 	descriptor.arrayLength = 1;
+-	descriptor.usage = MTLTextureUsageShaderRead;
++	descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+ 	descriptor.storageMode = MTLStorageModeShared;
+ 	id<MTLTexture> view = [bufferIt->second newTextureWithDescriptor:descriptor offset:0 bytesPerRow:rowBytes];
+ 	if (!view) {
+@@ -1549,6 +1643,8 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
+ 		return;
+ 	}
+ 
++	if (t->immutable) { gl4metalSetError(GL_INVALID_OPERATION); return; }
++
+ 	if (width == 0 || height == 0) {
+ 		// A zero-sized level has no Metal storage. At level 0, clear any old allocation; for an empty non-base mip,
+ 		// treat the definition as a no-op because Metal's mip chain is fixed when the texture is allocated.
+@@ -1573,7 +1669,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
+ 																	 height:(NSUInteger)height
+ 																  mipmapped:levels > 1];
+ 			d.mipmapLevelCount = levels;
+-			d.usage = MTLTextureUsageShaderRead;
++			d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+ 			if (mtlFormat != MTLPixelFormatRGB9E5Float) {
+ 				d.usage = d.usage | MTLTextureUsageRenderTarget; // RGB9E5 is not renderable
+ 			}
+@@ -1583,9 +1679,11 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
+ 			const bool canShaderWrite = !isDepthStencilFormat(mtlFormat) && mtlFormat != MTLPixelFormatRGB9E5Float;
+ 			if (canShaderWrite) d.usage = d.usage | MTLTextureUsageShaderWrite;
+ 			d.storageMode = isDepthStencilFormat(mtlFormat) ? MTLStorageModePrivate : MTLStorageModeShared;
++			enableTextureAtomics(d);
+ 			id<MTLTexture> newTexture = [ctx.device newTextureWithDescriptor:d];
+ 			if (!newTexture && canShaderWrite) {
+ 				d.usage = (MTLTextureUsage)(d.usage & ~MTLTextureUsageShaderWrite);
++				if (@available(iOS 17.0, *)) d.usage &= ~MTLTextureUsageShaderAtomic;
+ 				newTexture = [ctx.device newTextureWithDescriptor:d];
+ 			}
+ 			if (!newTexture) {
+@@ -1601,7 +1699,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
+ 			freshTextureStorage = true;
+ 		}
+ 		t->internalformat = (GLenum)internalformat;
+-	} else if (!t->texture || (NSUInteger)level >= t->texture.mipmapLevelCount ||
++	} else if (!t->texture || t->internalformat != (GLenum)internalformat || (NSUInteger)level >= t->texture.mipmapLevelCount ||
+ 			   width != std::max(1, t->width >> level) || height != std::max(1, t->height >> level)) {
+ 		gl4metalSetError(GL_INVALID_VALUE);
+ 		GL4METAL_LOG("glTexImage2D: level %d (%dx%d) does not fit the allocated mip chain", level, width, height);
+@@ -1653,6 +1751,8 @@ void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei widt
+ 			level, width, height, depth, internalformat);
+ 		return;
+ 	}
++	if (t->immutable) { gl4metalSetError(GL_INVALID_OPERATION); return; }
++
+ 	if (width == 0 || height == 0 || depth == 0) {
+ 		if (level == 0) {
+ 			endRenderEncoder();
+@@ -1681,15 +1781,17 @@ void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei widt
+ 			descriptor.mipmapLevelCount = levels;
+ 			descriptor.sampleCount = 1;
+ 			descriptor.arrayLength = 1;
+-			descriptor.usage = MTLTextureUsageShaderRead;
++			descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+ 			const bool canShaderWrite = !isDepthStencilFormat(mtlFormat) && mtlFormat != MTLPixelFormatRGB9E5Float;
+ 			if (canShaderWrite) descriptor.usage = descriptor.usage | MTLTextureUsageShaderWrite;
+ 			// Volume textures are sampled by the GPU, not directly exposed to CPU reads.
+ 			// Keep their storage GPU-local; uploads use an async shared-buffer blit path.
+ 			descriptor.storageMode = MTLStorageModePrivate;
++			enableTextureAtomics(descriptor);
+ 			id<MTLTexture> newTexture = [ctx.device newTextureWithDescriptor:descriptor];
+ 			if (!newTexture && canShaderWrite) {
+ 				descriptor.usage = (MTLTextureUsage)(descriptor.usage & ~MTLTextureUsageShaderWrite);
++				if (@available(iOS 17.0, *)) descriptor.usage &= ~MTLTextureUsageShaderAtomic;
+ 				newTexture = [ctx.device newTextureWithDescriptor:descriptor];
+ 			}
+ 			if (!newTexture) {
+@@ -1706,7 +1808,7 @@ void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei widt
+ 			freshTextureStorage = true;
+ 		}
+ 		t->internalformat = (GLenum)internalformat;
+-	} else if (!t->texture || t->texture.textureType != MTLTextureType3D ||
++	} else if (!t->texture || t->internalformat != (GLenum)internalformat || t->texture.textureType != MTLTextureType3D ||
+ 		(NSUInteger)level >= t->texture.mipmapLevelCount ||
+ 		width != std::max(1, t->width >> level) || height != std::max(1, t->height >> level) ||
+ 		depth != std::max(1, t->depth >> level)) {
+@@ -1720,6 +1822,60 @@ void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei widt
+ 	}
+ }
+ 
++static void textureStorage(GLenum target, GLsizei levels, GLenum internalformat,
++	GLsizei width, GLsizei height, GLsizei depth) {
++	const bool volume = target == GL_TEXTURE_3D;
++	const bool cube = target == GL_TEXTURE_CUBE_MAP;
++	if (!volume && !cube && target != GL_TEXTURE_2D) { gl4metalSetError(GL_INVALID_ENUM); return; }
++	const GLsizei limit = volume ? GL4METAL_MAX_3D_TEXTURE_SIZE : GL4METAL_MAX_TEXTURE_SIZE;
++	if (levels < 1 || width < 1 || height < 1 || depth < 1 || width > limit || height > limit ||
++		depth > limit || (cube && width != height)) { gl4metalSetError(GL_INVALID_VALUE); return; }
++	unsigned fullLevels = 1;
++	for (unsigned size = (unsigned)std::max({width, height, depth}); size > 1; size >>= 1) ++fullLevels;
++	if ((unsigned)levels > fullLevels) { gl4metalSetError(GL_INVALID_OPERATION); return; }
++	const MTLPixelFormat format = metalPixelFormat(internalformat);
++	// TexStorage accepts sized formats only.
++	if (format == MTLPixelFormatInvalid || internalformat == GL_RED || internalformat == GL_RG ||
++		internalformat == GL_RGB || internalformat == GL_RGBA || internalformat == GL_DEPTH_COMPONENT ||
++		internalformat == GL_DEPTH_STENCIL || (volume && isDepthStencilFormat(format))) {
++		gl4metalSetError(GL_INVALID_ENUM); return;
++	}
++	TextureObject *object = boundTexture(target);
++	if (!object || object->immutable) { gl4metalSetError(GL_INVALID_OPERATION); return; }
++	MTLTextureDescriptor *descriptor = [[MTLTextureDescriptor alloc] init];
++	descriptor.textureType = volume ? MTLTextureType3D : cube ? MTLTextureTypeCube : MTLTextureType2D;
++	descriptor.pixelFormat = format;
++	descriptor.width = (NSUInteger)width;
++	descriptor.height = (NSUInteger)height;
++	descriptor.depth = (NSUInteger)depth;
++	descriptor.mipmapLevelCount = (NSUInteger)levels;
++	descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
++	if (!volume && format != MTLPixelFormatRGB9E5Float) descriptor.usage |= MTLTextureUsageRenderTarget;
++	if (imageFormatClass(internalformat)) descriptor.usage |= MTLTextureUsageShaderWrite;
++	descriptor.storageMode = volume || isDepthStencilFormat(format) ? MTLStorageModePrivate : MTLStorageModeShared;
++	enableTextureAtomics(descriptor);
++	id<MTLTexture> storage = [ctx.device newTextureWithDescriptor:descriptor];
++	if (!storage) { gl4metalSetError(GL_OUT_OF_MEMORY); return; }
++	endRenderEncoder();
++	object->texture = storage;
++	object->width = width;
++	object->height = height;
++	object->depth = depth;
++	object->internalformat = internalformat;
++	object->immutable = true;
++	object->immutable_levels = levels;
++}
++
++void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height) {
++	if (target != GL_TEXTURE_2D && target != GL_TEXTURE_CUBE_MAP) { gl4metalSetError(GL_INVALID_ENUM); return; }
++	textureStorage(target, levels, internalformat, width, height, 1);
++}
++
++void glTexStorage3D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth) {
++	if (target != GL_TEXTURE_3D) { gl4metalSetError(GL_INVALID_ENUM); return; }
++	textureStorage(target, levels, internalformat, width, height, depth);
++}
++
+ void glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations) {
+ 	gl4metalSetError(GL_INVALID_OPERATION);
+ 	GL4METAL_LOG("glTexImage2DMultisample: Unimplemented");
+@@ -2024,6 +2180,24 @@ namespace {
+ 
+ static bool getTexImageBytesPerPixel(MTLPixelFormat format, NSUInteger &bytesPerPixel) {
+ 	switch (format) {
++		case MTLPixelFormatR8Sint: bytesPerPixel = 1; return true;
++		case MTLPixelFormatR8Uint: bytesPerPixel = 1; return true;
++		case MTLPixelFormatR16Sint: bytesPerPixel = 2; return true;
++		case MTLPixelFormatR16Uint: bytesPerPixel = 2; return true;
++		case MTLPixelFormatR32Sint: bytesPerPixel = 4; return true;
++		case MTLPixelFormatR32Uint: bytesPerPixel = 4; return true;
++		case MTLPixelFormatRG8Sint: bytesPerPixel = 2; return true;
++		case MTLPixelFormatRG8Uint: bytesPerPixel = 2; return true;
++		case MTLPixelFormatRG16Sint: bytesPerPixel = 4; return true;
++		case MTLPixelFormatRG16Uint: bytesPerPixel = 4; return true;
++		case MTLPixelFormatRG32Sint: bytesPerPixel = 8; return true;
++		case MTLPixelFormatRG32Uint: bytesPerPixel = 8; return true;
++		case MTLPixelFormatRGBA8Sint: bytesPerPixel = 4; return true;
++		case MTLPixelFormatRGBA8Uint: bytesPerPixel = 4; return true;
++		case MTLPixelFormatRGBA16Sint: bytesPerPixel = 8; return true;
++		case MTLPixelFormatRGBA16Uint: bytesPerPixel = 8; return true;
++		case MTLPixelFormatRGBA32Sint: bytesPerPixel = 16; return true;
++		case MTLPixelFormatRGBA32Uint: bytesPerPixel = 16; return true;
+ 		case MTLPixelFormatR8Unorm: bytesPerPixel = 1; return true;
+ 		case MTLPixelFormatRG8Unorm: bytesPerPixel = 2; return true;
+ 		case MTLPixelFormatRGBA8Unorm:
+@@ -2642,6 +2816,22 @@ static bool encodeClearTexel(MTLPixelFormat format, GLenum internalformat, GLenu
+ 	if ((!packed && scalarBytes == 0) || (packed && packedBytes == 0)) return false;
+ 	sourceBytes = packed ? packedBytes : (size_t)sourceComponents * scalarBytes;
+ 
++	bool signedInteger = false;
++	const bool isInteger = integerPixelFormat(format, signedInteger);
++	if (isInteger != integerExternalFormat(externalFormat)) return false;
++	if (isInteger) {
++		if (!integerScalarBytes(type)) return false;
++		int components = 0, bytes = 0;
++		if (!destLayout(format, components, bytes)) return false;
++		bytesPerPixel = size_t(components) * bytes;
++		for (int c = 0; c < components; ++c) {
++			const int64_t value = !data ? 0 : channelMap[c] < 0 ? (c == 3 ? 1 : 0) :
++				readIntegerComponent((const uint8_t *)data + size_t(channelMap[c]) * scalarBytes, type);
++			writeIntegerComponent(out + size_t(c) * bytes, bytes, signedInteger, value);
++		}
++		return true;
++	}
++
+ 	const bool depthFormat = format == MTLPixelFormatDepth16Unorm || format == MTLPixelFormatDepth32Float;
+ 	const bool stencilFormat = format == MTLPixelFormatStencil8;
+ 	if ((depthFormat && externalFormat != GL_DEPTH_COMPONENT) ||
+@@ -2741,6 +2931,12 @@ static bool encodeClearTexel(MTLPixelFormat format, GLenum internalformat, GLenu
+ 	return false;
+ }
+ 
++bool gl4metalEncodeClearValue(GLenum internalformat, GLenum format, GLenum type, const void *data,
++	uint8_t output[16], size_t &bytes) {
++	size_t sourceBytes = 0;
++	return encodeClearTexel(metalPixelFormat(internalformat), internalformat, format, type, data, output, bytes, sourceBytes);
++}
++
+ static bool clearTextureRegion(TextureObject &textureObject, GLint level,
+ 		GLint x, GLint y, GLint z, GLsizei width, GLsizei height, GLsizei depth,
+ 		GLenum format, GLenum type, const void *data, const char *caller) {
+@@ -2945,15 +3141,23 @@ void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void
+ 	const MTLPixelFormat mtlFormat = tex->texture.pixelFormat;
+ 	const bool depthFormat = isDepthStencilFormat(mtlFormat);
+ 
++	bool sourceSigned = false;
++	const bool sourceInteger = integerPixelFormat(mtlFormat, sourceSigned);
++	int integerComponents = 0, integerBytes = 0;
++	if (sourceInteger) destLayout(mtlFormat, integerComponents, integerBytes);
++	if (sourceInteger != integerExternalFormat(format) || (sourceInteger && !integerScalarBytes(type))) {
++		gl4metalSetError(GL_INVALID_OPERATION); return;
++	}
++
+ 	int components = 0;
+ 	int channels[4] = {0, 1, 2, 3};
+ 	switch (format) {
+-		case GL_RED: components = 1; channels[0] = 0; break;
+-		case GL_RG: components = 2; channels[0] = 0; channels[1] = 1; break;
+-		case GL_RGB: components = 3; channels[0] = 0; channels[1] = 1; channels[2] = 2; break;
+-		case GL_BGR: components = 3; channels[0] = 2; channels[1] = 1; channels[2] = 0; break;
+-		case GL_RGBA: components = 4; channels[0] = 0; channels[1] = 1; channels[2] = 2; channels[3] = 3; break;
+-		case GL_BGRA: components = 4; channels[0] = 2; channels[1] = 1; channels[2] = 0; channels[3] = 3; break;
++		case GL_RED_INTEGER: case GL_RED: components = 1; channels[0] = 0; break;
++		case GL_RG_INTEGER: case GL_RG: components = 2; channels[0] = 0; channels[1] = 1; break;
++		case GL_RGB_INTEGER: case GL_RGB: components = 3; channels[0] = 0; channels[1] = 1; channels[2] = 2; break;
++		case GL_BGR_INTEGER: case GL_BGR: components = 3; channels[0] = 2; channels[1] = 1; channels[2] = 0; break;
++		case GL_RGBA_INTEGER: case GL_RGBA: components = 4; channels[0] = 0; channels[1] = 1; channels[2] = 2; channels[3] = 3; break;
++		case GL_BGRA_INTEGER: case GL_BGRA: components = 4; channels[0] = 2; channels[1] = 1; channels[2] = 0; channels[3] = 3; break;
+ 		case GL_DEPTH_COMPONENT: components = 1; channels[0] = 0; break;
+ 		default:
+ 			gl4metalSetError(GL_INVALID_ENUM);
+@@ -3070,6 +3274,20 @@ void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void
+ 			uint8_t *dstRow = destination + image * imageStride + y * rowStride;
+ 			for (NSUInteger x = 0; x < width; ++x) {
+ 			const uint8_t *srcPixel = srcRow + x * sourceBytesPerPixel;
++			if (sourceInteger) {
++				const GLenum sourceType = integerBytes == 1 ? (sourceSigned ? GL_BYTE : GL_UNSIGNED_BYTE) :
++					integerBytes == 2 ? (sourceSigned ? GL_SHORT : GL_UNSIGNED_SHORT) : (sourceSigned ? GL_INT : GL_UNSIGNED_INT);
++				const bool destSigned = type == GL_BYTE || type == GL_SHORT || type == GL_INT;
++				for (int c = 0; c < components; ++c) {
++					const int channel = channels[c];
++					const int64_t value = channel < integerComponents ? readIntegerComponent(srcPixel + size_t(channel) * integerBytes, sourceType) :
++						(channel == 3 ? 1 : 0);
++					writeIntegerComponent(dstRow + x * outputPixelBytes + size_t(c) * scalarBytes,
++						(unsigned)scalarBytes, destSigned, value, ctx.pack_swap_bytes != GL_FALSE);
++				}
++			continue;
++			}
++
+ 			float rgba[4];
+ 			if (!decodeTexturePixel(mtlFormat, srcPixel, rgba)) {
+ 				gl4metalSetError(GL_INVALID_OPERATION);
+@@ -3123,6 +3341,10 @@ void glGetTexParameteriv(GLenum target, GLenum pname, GLint *params) {
+ 		return;
+ 	}
+ 	switch (pname) {
++		case GL_TEXTURE_IMMUTABLE_FORMAT: *params = tex->immutable ? GL_TRUE : GL_FALSE; break;
++		case GL_TEXTURE_IMMUTABLE_LEVELS: *params = tex->immutable_levels; break;
++		case GL_IMAGE_FORMAT_COMPATIBILITY_TYPE: *params = GL_IMAGE_FORMAT_COMPATIBILITY_BY_CLASS; break;
++
+ 		case GL_TEXTURE_MIN_FILTER:   *params = (GLint)tex->min_filter; break;
+ 		case GL_TEXTURE_MAG_FILTER:   *params = (GLint)tex->mag_filter; break;
+ 		case GL_TEXTURE_WRAP_S:       *params = (GLint)tex->wrap_s; break;
+diff --git a/gl4metal/uniform.mm b/gl4metal/uniform.mm
+index f02b80d67df8b0fa61dbcfa6a09ae86bcfe5d3a8..4894fd217b76beeab3c28294d04a182f66795eb2 100644
+--- a/gl4metal/uniform.mm
++++ b/gl4metal/uniform.mm
+@@ -496,7 +496,7 @@ static GLenum storageVariableGLType(const TranslatedUniform &uniform) {
+ }
+ 
+ static std::string storageVariableResourceName(const TranslatedUniform &member) {
+-	return member.array_size != 1 ? member.name + "[0]" : member.name;
++	return (member.is_array || member.array_size != 1) ? member.name + "[0]" : member.name;
+ }
+ 
+ static bool getStorageVariableByIndex(const ProgramObject &program, GLuint resourceIndex,
+@@ -744,7 +744,7 @@ void glGetProgramResourceiv(GLuint program, GLenum programInterface, GLuint inde
+ 			if (referenced >= 0) { appendValue(referenced); continue; }
+ 			switch (property) {
+ 				case GL_BUFFER_BINDING: appendValue((GLint)storageBlock->binding); break;
+-				case GL_BUFFER_DATA_SIZE: appendValue((GLint)storageBlock->required_size); break;
++				case GL_BUFFER_DATA_SIZE: appendValue((GLint)storageBlock->data_size); break;
+ 				case GL_NUM_ACTIVE_VARIABLES: appendValue((GLint)storageBlock->members.size()); break;
+ 				case GL_ACTIVE_VARIABLES: {
+ 					GLuint baseIndex = 0;
+@@ -770,8 +770,8 @@ void glGetProgramResourceiv(GLuint program, GLenum programInterface, GLuint inde
+ 				case GL_MATRIX_STRIDE: appendValue((GLint)stage.matrix_stride); break;
+ 				case GL_IS_ROW_MAJOR: appendValue(stage.row_major ? GL_TRUE : GL_FALSE); break;
+ 				case GL_BLOCK_INDEX: appendValue((GLint)parentBlockIndex); break;
+-				case GL_TOP_LEVEL_ARRAY_SIZE: appendValue(storageMember->array_size); break;
+-				case GL_TOP_LEVEL_ARRAY_STRIDE: appendValue((GLint)stage.array_stride); break;
++				case GL_TOP_LEVEL_ARRAY_SIZE: appendValue(storageMember->top_level_array_size); break;
++				case GL_TOP_LEVEL_ARRAY_STRIDE: appendValue((GLint)storageMember->top_level_array_stride); break;
+ 				case GL_NAME_LENGTH: appendValue((GLint)storageVariableResourceName(*storageMember).size() + 1); break;
+ 				default: gl4metalSetError(GL_INVALID_ENUM); break;
+ 			}
+diff --git a/tests/gpu_resource_tests.mm b/tests/gpu_resource_tests.mm
+new file mode 100644
+index 0000000000000000000000000000000000000000..2fb997fef655e67c222ec7430f2a2fb7c57f89e7
+--- /dev/null
++++ b/tests/gpu_resource_tests.mm
+@@ -0,0 +1,186 @@
++#include "gl4metal.h"
++#include <array>
++#include <stdexcept>
++
++// Opt-in device test. Run on the GL submission thread in a fresh context, before
++// application rendering. Returns 0 on success, 1 on failure, 77 when unsupported.
++extern "C" __attribute__((visibility("default"))) int gl4metalRunResourceTests();
++
++namespace {
++void require(bool ok, const char *message) {
++	if (!ok) throw std::runtime_error(message);
++}
++void noError(const char *operation) {
++	const GLenum error = glGetError();
++	if (error != GL_NO_ERROR)
++		throw std::runtime_error(std::string(operation) + ": GL error " + std::to_string(error));
++}
++struct Resources {
++	GLuint texture = 0;
++	GLuint buffers[2] = {};
++	std::vector<GLuint> programs;
++	~Resources() {
++		glUseProgram(0);
++		for (GLuint program : programs) glDeleteProgram(program);
++		glDeleteTextures(1, &texture);
++		glDeleteBuffers(2, buffers);
++	}
++	GLuint compute(const char *source) {
++		const GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
++		glShaderSource(shader, 1, &source, nullptr);
++		glCompileShader(shader);
++		GLint compiled = 0;
++		glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
++		char log[8192] = {};
++		glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
++		if (!compiled) { glDeleteShader(shader); throw std::runtime_error(log); }
++		const GLuint program = glCreateProgram();
++		programs.push_back(program);
++		glAttachShader(program, shader);
++		glLinkProgram(program);
++		glDeleteShader(shader);
++		GLint linked = 0;
++		glGetProgramiv(program, GL_LINK_STATUS, &linked);
++		glGetProgramInfoLog(program, sizeof(log), nullptr, log);
++		if (!linked) throw std::runtime_error(log);
++		return program;
++	}
++};
++}
++
++int gl4metalRunResourceTests() {
++	@autoreleasepool {
++		if (!gl4metalInit() || !gl4metalSupportsComputeShaders()) return 77;
++		try {
++			Resources resources;
++			noError("initial state");
++			glGenTextures(1, &resources.texture);
++			glBindTexture(GL_TEXTURE_3D, resources.texture);
++			// Binding before allocation must resolve the eventual allocation at dispatch.
++			glBindImageTexture(5, resources.texture, 1, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
++			glTexStorage3D(GL_TEXTURE_3D, 3, GL_R32UI, 4, 4, 4);
++			GLint immutable = 0, levels = 0;
++			glGetTexParameteriv(GL_TEXTURE_3D, GL_TEXTURE_IMMUTABLE_FORMAT, &immutable);
++			glGetTexParameteriv(GL_TEXTURE_3D, GL_TEXTURE_IMMUTABLE_LEVELS, &levels);
++			require(immutable && levels == 3, "immutable volume metadata");
++			std::array<GLuint, 8> initial{}, pixels{}, result{};
++			for (GLuint i = 0; i < initial.size(); ++i) initial[i] = 0xf1234500u + i;
++			glTexSubImage3D(GL_TEXTURE_3D, 1, 0, 0, 0, 2, 2, 2, GL_RED_INTEGER, GL_UNSIGNED_INT, initial.data());
++
++			glGenBuffers(2, resources.buffers);
++			GLint alignment = 0;
++			glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &alignment);
++			const GLintptr offset = std::max(alignment, 16);
++			glBindBuffer(GL_SHADER_STORAGE_BUFFER, resources.buffers[0]);
++			glBufferData(GL_SHADER_STORAGE_BUFFER, offset + sizeof(result), nullptr, GL_DYNAMIC_COPY);
++			const GLuint sentinel = 0x13579bdf;
++			glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &sentinel);
++			glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, offset, sizeof(result), GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
++			glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 2, resources.buffers[0], offset, sizeof(result));
++			const GLuint program = resources.compute(R"(#version 450
++#define VOLUME_UNIT (3 + 2)
++layout(local_size_x=1, local_size_y=1, local_size_z=1) in;
++layout(r32ui, binding=VOLUME_UNIT) uniform uimage3D volume;
++layout(std430, binding=2) buffer Results { uint values[]; } outputData;
++void main() {
++    ivec3 p = ivec3(gl_GlobalInvocationID);
++    uint i = uint(p.x + 2 * (p.y + 2 * p.z));
++    uint value = imageLoad(volume, p).x + uint(outputData.values.length()) + gl_NumWorkGroups.x;
++    imageStore(volume, p, uvec4(value));
++    outputData.values[i] = value;
++})");
++			const GLuint block = glGetProgramResourceIndex(program, GL_SHADER_STORAGE_BLOCK, "Results");
++			require(block != GL_INVALID_INDEX, "SSBO block reflection");
++			const GLenum properties[] = {GL_BUFFER_BINDING, GL_BUFFER_DATA_SIZE};
++			GLint metadata[2] = {};
++			glGetProgramResourceiv(program, GL_SHADER_STORAGE_BLOCK, block, 2, properties, 2, nullptr, metadata);
++			require(metadata[0] == 2 && metadata[1] == 4, "SSBO binding and runtime tail size");
++			const GLint imageLocation = glGetUniformLocation(program, "volume");
++			require(imageLocation >= 0, "image uniform location");
++			glUseProgram(program);
++			glUniform1i(imageLocation, 5);
++			noError("resource setup");
++			glDispatchCompute(2, 2, 2);
++			glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT);
++			// A partial CPU write must preserve the GPU's writes to all other bytes.
++			const GLuint replacement = 0xdeadbeef;
++			glBufferSubData(GL_SHADER_STORAGE_BUFFER, offset, sizeof(replacement), &replacement);
++			glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, offset, sizeof(result), result.data());
++			glGetTexImage(GL_TEXTURE_3D, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, pixels.data());
++			for (size_t i = 0; i < initial.size(); ++i) {
++				require(pixels[i] == initial[i] + 10, "3D image mip writes / exact uint32 readback");
++				require(result[i] == (i == 0 ? replacement : initial[i] + 10), "partial SSBO update preserves GPU writes");
++			}
++			GLuint prefix = 0;
++			glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(prefix), &prefix);
++			require(prefix == sentinel, "ranged SSBO dispatch preserves prefix");
++			noError("direct dispatch and readback");
++
++			// Produce indirect arguments on the GPU, then consume them after a barrier.
++			const GLuint argumentProgram = resources.compute(R"(#version 430
++layout(local_size_x=1) in;
++layout(std430, binding=3) buffer Arguments { uint x; uint y; uint z; } args;
++void main() { args.x = 2; args.y = 2; args.z = 2; }
++)");
++			glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, resources.buffers[1]);
++			glBufferData(GL_DISPATCH_INDIRECT_BUFFER, 12, nullptr, GL_DYNAMIC_COPY);
++			glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, resources.buffers[1]);
++			glUseProgram(argumentProgram);
++			glDispatchCompute(1, 1, 1);
++			glMemoryBarrier(GL_COMMAND_BARRIER_BIT);
++			glUseProgram(program);
++			glDispatchComputeIndirect(0);
++			glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT);
++			glBindBuffer(GL_SHADER_STORAGE_BUFFER, resources.buffers[0]);
++			auto *mapped = static_cast<const GLuint *>(glMapBufferRange(GL_SHADER_STORAGE_BUFFER, offset, sizeof(result), GL_MAP_READ_BIT));
++			require(mapped != nullptr, "map GPU-written range");
++			GLint64 mapOffset = 0, mapLength = 0;
++			void *mapPointer = nullptr;
++			glGetBufferParameteri64v(GL_SHADER_STORAGE_BUFFER, GL_BUFFER_MAP_OFFSET, &mapOffset);
++			glGetBufferParameteri64v(GL_SHADER_STORAGE_BUFFER, GL_BUFFER_MAP_LENGTH, &mapLength);
++			glGetBufferPointerv(GL_SHADER_STORAGE_BUFFER, GL_BUFFER_MAP_POINTER, &mapPointer);
++			require(mapOffset == offset && mapLength == sizeof(result) && mapPointer == mapped, "mapped range queries");
++			for (size_t i = 0; i < initial.size(); ++i) require(mapped[i] == initial[i] + 20, "GPU-generated indirect dispatch");
++			glDispatchCompute(1, 1, 1);
++			require(glGetError() == GL_INVALID_OPERATION, "reject dispatch using a mapped SSBO");
++			require(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), "unmap SSBO");
++			glClearTexImage(resources.texture, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
++			glGetTexImage(GL_TEXTURE_3D, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, pixels.data());
++			for (GLuint pixel : pixels) require(pixel == 0, "clear integer volume mip");
++			noError("indirect dispatch, mapping and clear");
++
++			if (@available(iOS 17.0, *)) {
++				const GLuint atomicProgram = resources.compute(R"(#version 430
++layout(local_size_x=8) in;
++layout(r32ui, binding=5) uniform uimage3D volume;
++layout(std430, binding=2) buffer Results { uint values[]; } outputData;
++shared uint count;
++void main() {
++    if (gl_LocalInvocationIndex == 0) count = 0;
++    barrier(); atomicAdd(count, 1); barrier();
++    imageAtomicAdd(volume, ivec3(0), count);
++    atomicAdd(outputData.values[0], 1);
++})");
++				glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, offset, sizeof(result), GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
++				glUseProgram(atomicProgram);
++				glDispatchCompute(1, 1, 1);
++				glMemoryBarrier(GL_ALL_BARRIER_BITS);
++				glGetTexImage(GL_TEXTURE_3D, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, pixels.data());
++				glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, offset, sizeof(result), result.data());
++				require(pixels[0] == 64 && result[0] == 8, "image, SSBO and shared-memory atomics");
++			}
++			// BufferData replaces the store and implicitly ends an existing mapping.
++			require(glMapBuffer(GL_SHADER_STORAGE_BUFFER, GL_WRITE_ONLY) != nullptr, "map before replacement");
++			glBufferData(GL_SHADER_STORAGE_BUFFER, 16, nullptr, GL_DYNAMIC_COPY);
++			GLint mappedState = GL_TRUE;
++			glGetBufferParameteriv(GL_SHADER_STORAGE_BUFFER, GL_BUFFER_MAPPED, &mappedState);
++			require(mappedState == GL_FALSE, "BufferData implicitly unmaps old storage");
++			noError("atomics and storage replacement");
++			GL4METAL_LOG("GPU resource tests passed");
++			return 0;
++		} catch (const std::exception &error) {
++			GL4METAL_LOG("GPU resource tests failed: %s", error.what());
++			return 1;
++		}
++	}
++}
+diff --git a/tests/translator_tests.cpp b/tests/translator_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b19ec368ae0d6f7a05b31eb3af43ba57a88edcf6
+--- /dev/null
++++ b/tests/translator_tests.cpp
+@@ -0,0 +1,160 @@
++#include "shadertranslator.h"
++#include "imageformats.h"
++#include <GL/glcorearb.h>
++#include <cstdlib>
++#include <iostream>
++#include <filesystem>
++#include <fstream>
++#include <stdexcept>
++
++static void require(bool condition, const std::string &message) {
++	if (!condition) throw std::runtime_error(message);
++}
++
++static TranslatedProgram compute(const std::string &source) {
++	TranslatedProgram result;
++	require(translateComputeProgram(source, result), result.log);
++	return result;
++}
++
++int main(int argc, char **argv) {
++	try {
++		uint8_t integer[4] = {};
++		writeIntegerComponent(integer, 4, false, 0xf1234567u);
++		require(readIntegerComponent(integer, GL_UNSIGNED_INT) == 0xf1234567u, "full-width unsigned transfer");
++		writeIntegerComponent(integer, 4, true, -123456789, true);
++		require(readIntegerComponent(integer, GL_INT, true) == -123456789, "signed byte-swapped transfer");
++		writeIntegerComponent(integer, 1, false, -1);
++		require(integer[0] == 0, "signed to unsigned clamp");
++		writeIntegerComponent(integer, 1, true, 500);
++		require(integer[0] == 127, "integer narrowing clamp");
++		require(imageFormatClass(GL_R32UI) == imageFormatClass(GL_R32F) &&
++			imageFormatClass(GL_R32UI) != imageFormatClass(GL_RGBA8), "image compatibility classes");
++		auto images = compute(R"(#version 450
++#define IMAGE_UNIT (3 + 2)
++layout(local_size_x=4, local_size_y=2, local_size_z=2) in;
++layout(r32ui, binding=IMAGE_UNIT) uniform uimage3D volume[2];
++layout(rgba32i, binding=1) writeonly uniform iimage2D signedImage;
++layout(std430, binding=5) buffer Data { uint values[]; } data;
++void main() {
++    ivec3 p = ivec3(gl_GlobalInvocationID);
++    imageStore(volume[0], p, uvec4(data.values[0]));
++    imageStore(volume[1], p, imageLoad(volume[0], p));
++    imageStore(signedImage, p.xy, ivec4(-1));
++    data.values[gl_LocalInvocationIndex] = uint(data.values.length()) + gl_NumWorkGroups.x;
++})");
++		require(images.storage_images.size() == 3, "image array reflection");
++		for (const auto &image : images.storage_images) {
++			if (image.name == "volume[0]") {
++				require(image.binding == 5 && image.gl_type == GL_UNSIGNED_INT_IMAGE_3D, "macro image binding/type");
++				require(image.stage[2].present && image.is_3d, "compute image stage");
++			} else if (image.name == "volume[1]") require(image.binding == 6, "consecutive image array bindings");
++			else require(image.gl_type == GL_INT_IMAGE_2D && image.write_only, "signed image type/access");
++		}
++		require(images.needs_buffer_size_buffer[2], "SSBO runtime length helper");
++		require(images.workgroup_size[0] == 4 && images.workgroup_size[2] == 2, "3D workgroup dimensions");
++		require(images.msl[2].find("threadgroups_per_grid") != std::string::npos, "gl_NumWorkGroups mapping");
++
++		auto nested = compute(R"(#version 430
++layout(local_size_x=1) in;
++struct Particle { vec4 position; mat2 basis; uint flags[2]; };
++layout(std430, binding=2) buffer Particles { uint count; Particle particles[]; } state;
++void main() { state.particles[0].flags[1] = state.count + uint(state.particles.length()); }
++)");
++		require(nested.storage_buffers.size() == 1, "nested SSBO block count");
++		const auto &block = nested.storage_buffers[0];
++		require(block.runtime_sized && block.binding == 2 && block.required_size == 16, "runtime struct prefix/binding: " +
++			std::to_string(block.runtime_sized) + "/" + std::to_string(block.binding) + "/" + std::to_string(block.required_size));
++		require(block.members.size() == 4, "recursive SSBO leaf reflection");
++		require(block.data_size == 64, "query size includes one runtime struct element");
++		bool flags = false;
++		for (const auto &member : block.members) {
++			if (member.name == "Particles.particles[0].flags") {
++				flags = true;
++				require(member.stage[2].offset == 48 && member.stage[2].array_stride == 4, "nested array offset/stride");
++				require(member.array_size == 2 && member.top_level_array_size == 0 && member.top_level_array_stride == 48,
++					"nested versus top-level array metadata");
++			}
++		}
++		require(flags, "nested SSBO resource name");
++		auto anonymous = compute(R"(#version 430
++layout(local_size_x=1) in;
++layout(std430, binding=0) buffer Data { uint values[]; };
++void main() { values[0] = uint(values.length()); }
++)");
++		require(anonymous.storage_buffers[0].members[0].name == "values", "anonymous SSBO member name");
++		require(anonymous.storage_buffers[0].required_size == 0 && anonymous.storage_buffers[0].data_size == 4,
++			"empty runtime range versus query size");
++
++		TranslatedProgram graphics;
++		require(translateProgram(R"(#version 450
++layout(r32f, binding=4) readonly uniform image3D voxels;
++layout(std430, binding=2+3) buffer SharedData { vec4 value; } state;
++void main() { gl_Position = vec4(imageLoad(voxels, ivec3(0)).x) + state.value; }
++)", R"(#version 450
++layout(r32f, binding=4) readonly uniform image3D voxels;
++layout(rgba32f, binding=0) writeonly uniform image2D outputImage;
++layout(std430, binding=2+3) buffer SharedData { vec4 value; } state;
++layout(location=0) out vec4 color;
++void main() { color = imageLoad(voxels, ivec3(0)); imageStore(outputImage, ivec2(0), color); state.value = color; }
++)", graphics, {}), graphics.log);
++		require(graphics.storage_images.size() == 2, "shared graphics image uniform");
++		bool shared = false;
++		for (const auto &image : graphics.storage_images)
++			if (image.name == "voxels") shared = image.stage[0].present && image.stage[1].present && image.binding == 4;
++		require(shared, "per-stage graphics image slots");
++		require(graphics.storage_buffers.size() == 1 && graphics.storage_buffers[0].binding == 5 &&
++			graphics.storage_buffers[0].stage[0].present && graphics.storage_buffers[0].stage[1].present,
++			"graphics SSBO expression binding and stage merging");
++
++		const std::string atomicSource = R"(#version 430
++layout(local_size_x=8) in;
++layout(r32ui, binding=0) uniform uimage3D voxels;
++layout(std430, binding=0) buffer Counters { uint count; } counter;
++shared uint localCount;
++void main() {
++    if (gl_LocalInvocationIndex == 0) localCount = 0;
++    barrier();
++    atomicAdd(localCount, 1);
++    barrier();
++    uint previous = imageAtomicAdd(voxels, ivec3(gl_GlobalInvocationID), localCount);
++    atomicAdd(counter.count, previous);
++})";
++		TranslatedProgram atomic;
++		require(translateComputeProgram(atomicSource, atomic, 30100), atomic.log);
++		require(atomic.msl[2].find("atomic_fetch_add") != std::string::npos, "native image/SSBO atomics");
++		require(atomic.msl[2].find("threadgroup_barrier") != std::string::npos, "workgroup barrier");
++		TranslatedProgram legacyAtomic;
++		require(!translateComputeProgram(atomicSource, legacyAtomic, 20200), "old Metal must reject unsupported image atomics");
++
++		TranslatedProgram invalid;
++		require(!translateComputeProgram(R"(#version 430
++layout(local_size_x=1) in;
++layout(std430, binding=0) buffer Blocks { uint value; } blocks[2];
++void main() { blocks[0].value = blocks[1].value; }
++)", invalid), "unsupported block arrays must fail instead of binding the wrong buffer");
++		require(!translateComputeProgram("#version 430\nlayout(local_size_x=0) in; void main() {}", invalid), "invalid local size rejected");
++		std::string compileLog;
++		require(!validateComputeShader("#version 430\nlayout(local_size_x=1) in; void main() { broken; }", compileLog) &&
++			!compileLog.empty(), "compute compilation reports syntax errors");
++		if (argc == 2) {
++			std::filesystem::create_directories(argv[1]);
++			auto dump = [&](const char *name, const std::string &source) {
++				std::ofstream file(std::filesystem::path(argv[1]) / name);
++				file << source;
++				require(bool(file), "write MSL fixture");
++			};
++			dump("images.metal", images.msl[2]);
++			dump("nested.metal", nested.msl[2]);
++			dump("anonymous.metal", anonymous.msl[2]);
++			dump("vertex_images.metal", graphics.msl[0]);
++			dump("fragment_images.metal", graphics.msl[1]);
++			dump("atomics.metal", atomic.msl[2]);
++		}
++		std::cout << "All shader resource regression tests passed\n";
++		return EXIT_SUCCESS;
++	} catch (const std::exception &e) {
++		std::cerr << e.what() << '\n';
++		return EXIT_FAILURE;
++	}
++}

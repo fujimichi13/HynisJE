@@ -1,58 +1,132 @@
-name: Development build
+name: Build Hynis + custom gl4metal
 
 on:
-  pull_request:
   push:
+    branches-ignore: ['l10n_main']
+  pull_request:
+    branches-ignore: ['l10n_main']
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: Development build
-
     runs-on: macos-latest
+    timeout-minutes: 120
     steps:
-      - name: Install dependencies
-        run: brew install temurin@8 ldid make
-          
-      - name: Checkout repository
+      - name: Checkout Hynis
         uses: actions/checkout@v4
 
-      - name: Checkout repository submodules
-        run: git submodule update --init --recursive
-
-      - name: Build
+      - name: Read pinned gl4metal version
+        id: renderer
         run: |
-          export PATH=/opt/procursus/bin:/opt/homebrew/bin:$PATH
-          export SLIMMED=1
-          gmake -j$(sysctl -n hw.ncpu) package
-          gmake -j$(sysctl -n hw.ncpu) package TROLLSTORE_JIT_ENT=1
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          manifest = json.loads(Path('patches/gl4metal/manifest.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('repository=' + manifest['repository'] + '\n')
+              output.write('ref=' + manifest['base_commit'] + '\n')
+          PY
 
-      - name: Upload regular ipa
+      - name: Checkout pinned gl4metal and its dependencies
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.renderer.outputs.repository }}
+          ref: ${{ steps.renderer.outputs.ref }}
+          path: Natives/external/gl4metal
+          submodules: recursive
+
+      - name: Apply our 3D image, SSBO and compute changes
+        run: python3 scripts/apply_gl4metal_patch.py Natives/external/gl4metal
+
+      - name: Checkout launcher dependencies
+        run: |
+          git submodule update --init --recursive -- \
+            Natives/external/AFNetworking Natives/external/DBNumberedSlider \
+            Natives/external/fishhook Natives/external/MobileGlues
+
+      - name: Install build tools
+        run: brew install make ldid wget cmake
+
+      - name: Install Java 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Check launcher bridge
+        run: |
+          cmake -S tests -B build/bridge-tests
+          cmake --build build/bridge-tests
+          ctest --test-dir build/bridge-tests --output-on-failure
+
+      - name: Check custom shader translation and Metal shaders
+        run: |
+          if ! xcrun --sdk iphoneos metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          cmake -S Natives/external/gl4metal -B build/renderer-tests \
+            -DGL4METAL_TRANSLATOR_TESTS_ONLY=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/renderer-tests --target translator_tests --parallel 3
+          ctest --test-dir build/renderer-tests --output-on-failure
+          build/renderer-tests/translator_tests build/renderer-tests/msl
+          for source in build/renderer-tests/msl/*.metal; do
+            standard=ios-metal2.2
+            if grep -q 'gl4metal MSL 30100' "$source"; then standard=ios-metal3.1; fi
+            xcrun --sdk iphoneos metal -std="$standard" -c "$source" -o "$source.air"
+          done
+
+      - name: Build iOS IPA and TrollStore TIPA
+        run: |
+          gmake -j2 dsym package PLATFORM=2 JOBS=3 SLIMMED=1 BOOTJDK="$JAVA_HOME/bin"
+          gmake -j2 dsym package PLATFORM=2 JOBS=3 SLIMMED=1 BOOTJDK="$JAVA_HOME/bin" TROLLSTORE_JIT_ENT=1
+
+      - name: Record the exact renderer build
+        run: |
+          cp patches/gl4metal/manifest.json artifacts/gl4metal-build.json
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          path = Path('artifacts/gl4metal-build.json')
+          manifest = json.loads(path.read_text())
+          manifest['hynis_commit'] = os.environ['GITHUB_SHA']
+          manifest['library_sha256'] = hashlib.sha256(Path('Natives/build/libgl4metal.dylib').read_bytes()).hexdigest()
+          path.write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+
+      - name: Upload iOS app
         uses: actions/upload-artifact@v4
         with:
-          name: com.congcq.hynis
-          path: artifacts/com.congcq.hynis-*.ipa
+          name: Hynis-custom-gl4metal-iOS
+          if-no-files-found: error
+          path: |
+            artifacts/com.congcq.hynis-*-ios.ipa
+            artifacts/com.congcq.hynis-*-ios-trollstore.tipa
+            artifacts/gl4metal-build.json
 
-      - name: Upload regular tipa
+      - name: Upload slimmed app
         uses: actions/upload-artifact@v4
         with:
-          name: com.congcq.hynis-trollstore
-          path: artifacts/com.congcq.hynis-*.tipa
+          name: Hynis-custom-gl4metal-iOS-slimmed
+          if-no-files-found: error
+          path: |
+            artifacts/com.congcq.hynis.slimmed-*-ios.ipa
+            artifacts/com.congcq.hynis.slimmed-*-ios-trollstore.tipa
+            artifacts/gl4metal-build.json
 
-      - name: Upload slimmed ipa
+      - name: Upload renderer library
         uses: actions/upload-artifact@v4
         with:
-          name: com.congcq.hynis.slimmed
-          path: artifacts/com.congcq.hynis.slimmed-*.ipa
+          name: custom-gl4metal-dylib
+          if-no-files-found: error
+          path: |
+            Natives/build/libgl4metal.dylib
+            artifacts/gl4metal-build.json
 
-      - name: Upload slimmed tipa
+      - name: Upload debug symbols
         uses: actions/upload-artifact@v4
         with:
-          name: com.congcq.hynis.slimmed-trollstore
-          path: artifacts/com.congcq.hynis.slimmed-*.tipa
-
-      - name: Upload jre
-        uses: actions/upload-artifact@v4
-        with:
-          name: java_runtimes
-          path: artifacts/java_runtimes/*
+          name: Hynis.dSYM
+          path: artifacts/Hynis.dSYM
