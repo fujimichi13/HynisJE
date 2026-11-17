@@ -158,6 +158,7 @@ add_executable(Hynis
   LauncherProfilesViewController.m
   LauncherSplitViewController.m
   MinecraftOptionUtils.m
+  MissingImpl.m
   MinecraftResourceDownloadTask.m
   MinecraftResourceUtils.m
   PickTextField.m
