@@ -19,6 +19,7 @@
 #import "utils.h"
 
 #include <sys/time.h>
+#include <unistd.h>
 
 #define AUTORESIZE_MASKS UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin
 
@@ -210,7 +211,8 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     if (!vc.requiredJavaVersion) {
         return;
     }
-    [self invokeAfterJITEnabled:^{
+    [self waitForJIT:^(BOOL ready) {
+        if (!ready) return;
         vc.modalPresentationStyle = UIModalPresentationFullScreen;
         NSLog(@"[ModInstaller] launching %@", vc.filepath);
         [self presentViewController:vc animated:YES completion:nil];
@@ -323,15 +325,23 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     }
 
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.progressViewMain.observedProgress != object) return;
         self.progressText.text = progress.localizedAdditionalDescription;
 
         if (!progress.finished) return;
         [self.progressVC dismissModalViewControllerAnimated:NO];
 
+        [object removeObserver:self forKeyPath:@"fractionCompleted" context:ProgressObserverContext];
         self.progressViewMain.observedProgress = nil;
         if (self.task.metadata) {
-            [self invokeAfterJITEnabled:^{
-                UIKit_launchMinecraftSurfaceVC(self.view.window, self.task.metadata);
+            [self waitForJIT:^(BOOL ready) {
+                if (ready) {
+                    UIKit_launchMinecraftSurfaceVC(self.view.window, self.task.metadata);
+                } else {
+                    self.task = nil;
+                    self.progressVC = nil;
+                    [self setInteractionEnabled:YES forDownloading:YES];
+                }
             }];
         } else {
             self.task = nil;
@@ -368,46 +378,82 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     });
 }
 
-- (void)invokeAfterJITEnabled:(void(^)(void))handler {
-    localVersionList = remoteVersionList = nil;
-    BOOL hasTrollStoreJIT = getEntitlementValue(@"com.apple.private.local.sandboxed-jit");
-
+- (void)waitForJIT:(void (^)(BOOL ready))completion {
+    void (^launch)(void) = ^{
+        localVersionList = remoteVersionList = nil;
+        completion(YES);
+    };
+    UIApplication *app = UIApplication.sharedApplication;
     if (isJITEnabled(false)) {
         [ALTServerManager.sharedManager stopDiscovering];
-        handler();
-        return;
-    } else if (hasTrollStoreJIT) {
-        NSURL *jitURL = [NSURL URLWithString:[NSString stringWithFormat:@"apple-magnifier://enable-jit?bundle-id=%@", NSBundle.mainBundle.bundleIdentifier]];
-        [UIApplication.sharedApplication openURL:jitURL options:@{} completionHandler:nil];
-        // Do not return, wait for TrollStore to enable JIT and jump back
-    } else if (getPrefBool(@"debug.debug_skip_wait_jit")) {
-        NSLog(@"Debug option skipped waiting for JIT. Java might not work.");
-        handler();
+        launch();
         return;
     }
 
-    self.progressText.text = localize(@"launcher.wait_jit.title", nil);
+    BOOL hasTrollStoreJIT = getEntitlementValue(@"com.apple.private.local.sandboxed-jit");
+    if (!hasTrollStoreJIT && getPrefBool(@"debug.debug_skip_wait_jit")) {
+        NSLog(@"Debug option skipped waiting for JIT. Java might not work.");
+        launch();
+        return;
+    }
 
-    UIAlertController* alert = [UIAlertController alertControllerWithTitle:localize(@"launcher.wait_jit.title", nil)
-        message:hasTrollStoreJIT ? localize(@"launcher.wait_jit_trollstore.message", nil) : localize(@"launcher.wait_jit.message", nil)
-        preferredStyle:UIAlertControllerStyleAlert];
-/* TODO:
-    UIAlertAction *cancel = [UIAlertAction actionWithTitle:localize(@"Cancel", nil) style:UIAlertActionStyleCancel handler:^{
-        
-    }];
-    [alert addAction:cancel];
-*/
-    [self presentViewController:alert animated:YES completion:nil];
-
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        while (!isJITEnabled(false)) {
-            // Perform check for every 200ms
-            usleep(1000*200);
+    NSString *bundleID = NSBundle.mainBundle.bundleIdentifier;
+    BOOL useStikDebug = [app canOpenURL:[NSURL URLWithString:@"stikdebug://enable-jit"]];
+    NSURLComponents *request = nil;
+    NSString *messageKey = @"launcher.wait_jit_manual.message";
+    if (bundleID.length && (useStikDebug || hasTrollStoreJIT)) {
+        request = [[NSURLComponents alloc] init];
+        request.scheme = useStikDebug ? @"stikdebug" : @"apple-magnifier";
+        request.host = @"enable-jit";
+        NSMutableArray *items = [NSMutableArray arrayWithObject:
+            [NSURLQueryItem queryItemWithName:@"bundle-id" value:bundleID]];
+        if (useStikDebug) {
+            [items addObject:[NSURLQueryItem queryItemWithName:@"pid" value:@(getpid()).stringValue]];
+            if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
+                [items addObject:[NSURLQueryItem queryItemWithName:@"script-name" value:@"universal.js"]];
+            }
+            messageKey = @"launcher.wait_jit_stikdebug.message";
+        } else {
+            messageKey = @"launcher.wait_jit_trollstore.message";
         }
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [alert dismissViewControllerAnimated:YES completion:handler];
-        });
-    });
+        request.queryItems = items;
+    }
+
+    self.progressText.text = localize(@"launcher.wait_jit.title", nil);
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:self.progressText.text
+        message:localize(messageKey, nil) preferredStyle:UIAlertControllerStyleAlert];
+    __block NSTimer *timer;
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"Cancel", nil)
+        style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+            [timer invalidate];
+            timer = nil;
+            self.progressText.text = nil;
+            completion(NO);
+        }]];
+
+    [self presentViewController:alert animated:YES completion:^{
+        __block NSURL *pendingURL = request.URL;
+        timer = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *tick) {
+            UIWindowScene *scene = self.view.window.windowScene;
+            if (!scene || scene.activationState != UISceneActivationStateForegroundActive) return;
+            if (isJITEnabled(false)) {
+                [tick invalidate];
+                timer = nil;
+                [ALTServerManager.sharedManager stopDiscovering];
+                [alert dismissViewControllerAnimated:YES completion:^{
+                    self.progressText.text = nil;
+                    launch();
+                }];
+            } else if (pendingURL) {
+                NSURL *url = pendingURL;
+                pendingURL = nil;
+                [app openURL:url options:@{} completionHandler:^(BOOL opened) {
+                    if (!opened) alert.message = localize(@"launcher.wait_jit_manual.message", nil);
+                }];
+            }
+        }];
+        [timer fire];
+    }];
 }
 
 #pragma mark - UIPopoverPresentationControllerDelegate

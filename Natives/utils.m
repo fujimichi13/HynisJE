@@ -13,13 +13,15 @@ void* SecTaskCreateFromSelf(CFAllocatorRef allocator);
 
 BOOL getEntitlementValue(NSString *key) {
     void *secTask = SecTaskCreateFromSelf(NULL);
-    CFTypeRef value = SecTaskCopyValueForEntitlement(SecTaskCreateFromSelf(NULL), key, nil);
+    if (!secTask) return NO;
+    CFTypeRef value = SecTaskCopyValueForEntitlement(secTask, key, nil);
+    BOOL enabled = value && [(__bridge id)value boolValue];
     if (value != nil) {
         CFRelease(value);
     }
     CFRelease(secTask);
 
-    return value != nil && [(__bridge id)value boolValue];
+    return enabled;
 }
 
 BOOL isJITEnabled(BOOL checkCSFlags) {
@@ -27,9 +29,8 @@ BOOL isJITEnabled(BOOL checkCSFlags) {
         return YES;
     }
 
-    int flags;
-    csops(getpid(), 0, &flags, sizeof(flags));
-    return (flags & CS_DEBUGGED) != 0;
+    int flags = 0;
+    return csops(getpid(), 0, &flags, sizeof(flags)) == 0 && (flags & CS_DEBUGGED) != 0;
 }
 
 void openLink(UIViewController* sender, NSURL* link) {
