@@ -4,8 +4,8 @@ jobs:
   bridge:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '8'
@@ -17,6 +17,7 @@ jobs:
       - name: Compile patched LWJGL bridge
         run: |
           mkdir -p build/java
-          javac -cp "$(find JavaApp/libs -name '*.jar' -print | paste -sd: -)" \
-            -sourcepath JavaApp/src/lwjgl:JavaApp/src/launcher \
+          javac -XDignore.symbol.file \
+            -cp "$(find JavaApp/libs/lwjgl-3.3.3 JavaApp/libs/others -name '*.jar' -print | paste -sd: -)" \
+            -sourcepath JavaApp/src/lwjgl-3.3.3:JavaApp/src/launcher \
             -d build/java JavaApp/src/lwjgl/org/lwjgl/glfw/GLFW.java
