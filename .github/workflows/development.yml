@@ -210,8 +210,8 @@ jobs:
         run: |
           set -o pipefail
           status=0
-          { gmake -j2 dsym package PLATFORM=2 JOBS=3 SLIMMED=1 BOOTJDK="$JAVA_HOME/bin" && \
-            gmake -j2 dsym package PLATFORM=2 JOBS=3 SLIMMED=1 BOOTJDK="$JAVA_HOME/bin" TROLLSTORE_JIT_ENT=1; } 2>&1 | tee build.log || status=$?
+          { gmake -j2 dsym package PLATFORM=2 JOBS=3 SLIMMED=1 RELEASE=1 BOOTJDK="$JAVA_HOME/bin" && \
+            gmake -j2 dsym package PLATFORM=2 JOBS=3 SLIMMED=1 RELEASE=1 BOOTJDK="$JAVA_HOME/bin" TROLLSTORE_JIT_ENT=1; } 2>&1 | tee build.log || status=$?
           echo
           echo "=============== ERRORS ==============="
           { grep -E -A40 'Undefined symbols' build.log | head -n 80; } || true
@@ -232,25 +232,33 @@ jobs:
           path.write_text(json.dumps(manifest, indent=2) + '\n')
           PY
 
-      - name: Upload iOS app
+      - name: Upload IPA (full)
         uses: actions/upload-artifact@v4
         with:
-          name: Hynis-custom-gl4metal-iOS
+          name: Hynis-IPA
           if-no-files-found: error
-          path: |
-            artifacts/com.congcq.hynis-*-ios.ipa
-            artifacts/com.congcq.hynis-*-ios-trollstore.tipa
-            artifacts/gl4metal-build.json
+          path: artifacts/com.congcq.hynis-*-ios.ipa
 
-      - name: Upload slimmed app
+      - name: Upload TIPA (full, TrollStore)
         uses: actions/upload-artifact@v4
         with:
-          name: Hynis-custom-gl4metal-iOS-slimmed
+          name: Hynis-TIPA
           if-no-files-found: error
-          path: |
-            artifacts/com.congcq.hynis.slimmed-*-ios.ipa
-            artifacts/com.congcq.hynis.slimmed-*-ios-trollstore.tipa
-            artifacts/gl4metal-build.json
+          path: artifacts/com.congcq.hynis-*-ios-trollstore.tipa
+
+      - name: Upload IPA (slimmed)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hynis-IPA-slimmed
+          if-no-files-found: error
+          path: artifacts/com.congcq.hynis.slimmed-*-ios.ipa
+
+      - name: Upload TIPA (slimmed, TrollStore)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hynis-TIPA-slimmed
+          if-no-files-found: error
+          path: artifacts/com.congcq.hynis.slimmed-*-ios-trollstore.tipa
 
       - name: Upload renderer library
         uses: actions/upload-artifact@v4
