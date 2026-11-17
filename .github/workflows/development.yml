@@ -61,7 +61,7 @@ jobs:
       - name: Install Java 8
         uses: actions/setup-java@v5
         with:
-          distribution: temurin
+          distribution: zulu
           java-version: '8'
 
       - name: Check launcher bridge
