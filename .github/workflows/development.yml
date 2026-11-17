@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout Hynis
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Read pinned gl4metal version
         id: renderer
@@ -31,7 +31,7 @@ jobs:
           PY
 
       - name: Checkout pinned gl4metal and its dependencies
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ steps.renderer.outputs.repository }}
           ref: ${{ steps.renderer.outputs.ref }}
@@ -45,13 +45,21 @@ jobs:
         run: |
           git submodule update --init --recursive -- \
             Natives/external/AFNetworking Natives/external/DBNumberedSlider \
-            Natives/external/fishhook Natives/external/MobileGlues
+            Natives/external/fishhook
+
+      - name: Checkout MobileGlues
+        uses: actions/checkout@v5
+        with:
+          repository: MobileGL-Dev/MobileGlues
+          ref: main
+          path: Natives/external/MobileGlues
+          submodules: recursive
 
       - name: Install build tools
         run: brew install make ldid wget cmake
 
       - name: Install Java 8
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '8'
