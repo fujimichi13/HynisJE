@@ -214,7 +214,7 @@ jobs:
             gmake -j2 dsym package PLATFORM=2 JOBS=3 SLIMMED=1 BOOTJDK="$JAVA_HOME/bin" TROLLSTORE_JIT_ENT=1; } 2>&1 | tee build.log || status=$?
           echo
           echo "=============== ERRORS ==============="
-          grep -E 'error:|fatal error:|Undefined symbols|No such file|No rule to make|actool|\*\*\* \[' build.log | sed 's|/Users/runner/work/HynisJE/HynisJE/||' | sort -u | head -n 60 || true
+          grep -E -A40 'Undefined symbols' build.log | head -n 80; grep -E 'error:|fatal error:|ld: |No such file|No rule to make|\*\*\* \[' build.log | sed 's|/Users/runner/work/HynisJE/HynisJE/||' | sort -u | head -n 60 || true
           echo "======================================="
           exit $status
 
