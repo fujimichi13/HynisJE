@@ -82,7 +82,7 @@ jobs:
           build/renderer-tests/translator_tests build/renderer-tests/msl
           for source in build/renderer-tests/msl/*.metal; do
             standard=ios-metal2.2
-            if grep -q 'gl4metal MSL 30100' "$source"; then standard=ios-metal3.1; fi
+            if grep -q 'gl4metal MSL 30100' "$source"; then standard=metal3.1; fi
             xcrun --sdk iphoneos metal -std="$standard" -c "$source" -o "$source.air"
           done
 
